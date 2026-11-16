@@ -1,16 +1,19 @@
-## Hi there 👋
+### Hey there 👋
 
-<!--
-**bmhiouah/bmhiouah** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+I'm Badre, an engineer in maths and data science based in France.
 
-Here are some ideas to get you started:
+I mostly work at the crossroads of finance and machine learning, from a derivatives desk at Barclays to data and LLM tools at Société Générale.
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+I enjoy building things with AI, and I'm genuinely optimistic about it: I think it will bring a lot of value to the world for those who learn how to use it well.
+
+This is where I share my projects, experiments and whatever I'm currently tinkering with.
+
+---
+
+### A Bit About Me
+
+- ♟️ I solve chess tactics on Lichess (peaked at 2500)
+- 𓀫 Always learning new jump rope tricks
+- 🌿 I love slowing down and contemplating nature
+- 🌍 Fluent in French, English and Python (in decreasing order of grammar mistakes)
+- 📬 Happy to chat: mhiouah.badre@gmail.com
