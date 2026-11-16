@@ -19,7 +19,7 @@ This is where I share my projects, experiments and whatever I'm currently tinker
 
 ### A Bit About Me
 
-- ♟️ I solve chess tactics on Lichess (peaked at 2500)
+- ♟️ I solve chess tactics on Lichess
 - 𓀫 Always learning new jump rope tricks
 - 🌿 I love slowing down and contemplating nature
 - 🌍 Fluent in French, English and Python (in decreasing order of grammar mistakes)
