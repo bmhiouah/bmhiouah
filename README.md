@@ -4,7 +4,7 @@ I'm Badre, an engineer in maths and data science based in France.
 
 I mostly work at the crossroads of finance and machine learning, from a derivatives desk at Barclays to data and LLM tools at Société Générale.
 
-I enjoy building things with AI, and I'm genuinely optimistic about it: I think it will bring a lot of value to the world for those who learn how to use it well.
+I enjoy building things with AI, and I'm genuinely optimistic about it: I think it will bring a lot of value to people in general.
 
 This is where I share my projects, experiments and whatever I'm currently tinkering with.
 
