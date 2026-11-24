@@ -6,13 +6,22 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
-# Never commit voice model weights or indexes
-models/**
-!models/.gitkeep
+# Local extract / cache under models (INDEX.md + shipped zips are tracked)
+models/_tmp/
+models/**/*.pth
+models/**/*.index
+models/**/*.onnx
+models/**/*.pt
+# Still ignore loose weights outside models/
 *.pth
 *.index
 *.onnx
 *.pt
+# Allow committed zip bundles under models/
+!models/*.zip
+!models/INDEX.md
+!models/.gitkeep
+!models/README.md
 
 # Local overrides
 configs/local.yaml

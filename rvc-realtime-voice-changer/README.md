@@ -9,7 +9,7 @@ Minimal foundation for **real-time** Retrieval-based Voice Conversion (**RVC V2*
 ## Plan (step-by-step)
 
 1. **Audio loop (done in skeleton)** — capture mic → optional process → play speakers via `sounddevice`
-2. **Model path wiring** — point `MODEL_PATH` / config at a local V2 checkpoint (you download; not shipped here)
+2. **Model path wiring** — point `MODEL_PATH` / config at a local V2 checkpoint (sample EN feminine zips under `models/`)
 3. **Inference hook** — replace `infer_rvc_v2()` passthrough with real HuBERT + RVC V2 synthesizer
 4. **Low-latency tuning** — block size, sample rate (often 40k/48k), buffering, optional `.index` retrieval
 5. **Later (out of scope now)** — GUI, VST, virtual cable routing, multi-speaker switching
@@ -30,16 +30,7 @@ Realtime-oriented peers for later ideas (not required here): [w-okada/voice-chan
 
 ## Where to get ready-made RVC V2 models
 
-**Do not download weights into this repo.** Place files you obtain yourself under `models/` (gitignored).
-
-Common sources:
-
-| Source | Notes |
-| --- | --- |
-| [lj1995/VoiceConversionWebUI](https://huggingface.co/lj1995/VoiceConversionWebUI) | Official-ish HF hub: pretrained assets, HuBERT, etc. |
-| Community HF spaces / model cards | Search Hugging Face for `RVC V2` + character/speaker name; prefer V2 `.pth` |
-| [voice-models.com](https://voice-models.com) | Catalog of shared community voice models |
-| RVC Discord / model-sharing boards | Often link HF mirrors; verify license and consent |
+**Seven free English feminine V2 zips ship under `models/`** (see [`models/INDEX.md`](models/INDEX.md) for exact filenames, byte sizes, and sources). Unzipped `.pth` / `.index` stay local (gitignored). Extra models: Hugging Face, [voice-models.com](https://voice-models.com), or [lj1995/VoiceConversionWebUI](https://huggingface.co/lj1995/VoiceConversionWebUI) for HuBERT.
 
 You typically need:
 
@@ -47,23 +38,23 @@ You typically need:
 - **Optional**: `*.index` (FAISS feature index for quality; skippable for first wiring)
 - **Shared**: HuBERT / content encoder weights (from the VoiceConversionWebUI hub or your RVC install)
 
-## Weights placeholder
+## Weights layout
 
 ```
 models/
-  .gitkeep                 # keep folder in git
-  YOUR_SPEAKER_v2.pth      # ← put your V2 model here (local only)
-  YOUR_SPEAKER_v2.index    # ← optional
+  INDEX.md                 # catalog: filenames + sizes
+  GirlVoice.zip … Frida.zip  # Git LFS archives (each contains .pth [+ .index])
+  _tmp/                    # local extract dir (ignored)
 ```
 
-Set the path via env or edit `configs/default.yaml`:
-
 ```bash
-export RVC_MODEL_PATH=models/YOUR_SPEAKER_v2.pth
+git lfs pull   # after clone
+unzip models/FurinaEN.zip -d models/_tmp/
+export RVC_MODEL_PATH=models/_tmp/furina-EN_v2_48k_e60/Furina_EN_e60_v2_48k.pth
 python -m src.realtime_vc
 ```
 
-Until a real file exists, the starter script runs **mic → speaker passthrough** and logs where inference would run.
+Until a real checkpoint is loaded, the starter script runs **mic → speaker passthrough** and logs where inference would run.
 
 ## Quick start
 
@@ -89,7 +80,8 @@ rvc-realtime-voice-changer/
   configs/
     default.yaml          # sample rate, block size, model path placeholders
   models/
-    .gitkeep              # weights go here; not committed
+    INDEX.md              # shipped zip catalog
+    *.zip                 # free EN feminine V2 weights (LFS)
   src/
     __init__.py
     realtime_vc.py        # mic → infer_rvc_v2() hook → speaker
@@ -99,6 +91,7 @@ rvc-realtime-voice-changer/
 
 - [x] Folder structure
 - [x] Runnable realtime audio passthrough + `infer_rvc_v2()` TODO hook
+- [x] Free EN feminine V2 model zips + `models/INDEX.md` (no inference yet)
 - [ ] Load real RVC V2 + HuBERT and convert in-loop
 - [ ] Optional FAISS index / pitch / formant controls
 - [ ] Latency / quality tuning guide
