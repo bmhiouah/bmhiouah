@@ -11,8 +11,12 @@ audio:
 
 model:
   # Relative to project root, or absolute path
-  path: models/YOUR_SPEAKER_v2.pth
-  index_path: null   # e.g. models/YOUR_SPEAKER_v2.index
+  # Frida (Hilda) EN — extract with: unzip models/Frida.zip -d models/_tmp/frida/
+  path: models/_tmp/frida/frida.pth
+  index_path: models/_tmp/frida/added_IVF780_Flat_nprobe_1_frida_v2.index
+  # Fallback: Female Pop Star — unzip models/FemalePopStar.zip -d models/_tmp/femalepopstar/
+  #   path: models/_tmp/femalepopstar/model.pth
+  #   index_path: models/_tmp/femalepopstar/model.index
   # device: cpu | cuda | mps
   device: cpu
 
