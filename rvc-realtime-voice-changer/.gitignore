@@ -8,10 +8,13 @@ __pycache__/
 
 # Local extract / cache under models (INDEX.md + shipped zips are tracked)
 models/_tmp/
+models/hubert/
 models/**/*.pth
 models/**/*.index
 models/**/*.onnx
 models/**/*.pt
+models/**/*.bin
+models/**/*.safetensors
 # Still ignore loose weights outside models/
 *.pth
 *.index

@@ -1,25 +1,30 @@
-# Realtime RVC V2 starter config — edit paths locally; do not commit weights.
+# Realtime RVC V2 — edit paths locally; do not commit weights.
 
 audio:
-  sample_rate: 48000
-  # Smaller block → lower latency, higher CPU / underrun risk
-  block_size: 1024
+  # Stream defaults to the model sample rate (Frida = 40000). Override via --sr.
+  sample_rate: 40000
+  # Larger blocks → more stable RVC on CPU; smaller → lower latency / more underruns
+  block_size: 4096
   channels: 1
-  # Leave null to use system default devices; or set integer device ids
+  # Leave null for auto: AirPods output when connected; built-in/default mic for input
   input_device: null
   output_device: null
 
 model:
   # Relative to project root, or absolute path
-  # Frida (Hilda) EN — extract with: unzip models/Frida.zip -d models/_tmp/frida/
+  # Frida (Hilda) EN — auto-unzip from models/Frida.zip on first run if missing
   path: models/_tmp/frida/frida.pth
   index_path: models/_tmp/frida/added_IVF780_Flat_nprobe_1_frida_v2.index
+  # Shared ContentVec (lj1995 hubert_base.pt → models/hubert/contentvec_hf/)
+  hubert_pt: models/hubert/hubert_base.pt
+  hubert_hf: models/hubert/contentvec_hf
   # Fallback: Female Pop Star — unzip models/FemalePopStar.zip -d models/_tmp/femalepopstar/
   #   path: models/_tmp/femalepopstar/model.pth
   #   index_path: models/_tmp/femalepopstar/model.index
-  # device: cpu | cuda | mps
-  device: cpu
+  # device: cpu | cuda | mps  (default: mps on Apple Silicon else cpu)
+  device: null
+  index_rate: 0.5
+  f0_up_key: 0
 
 runtime:
-  # passthrough until real RVC wiring lands in infer_rvc_v2()
-  mode: passthrough
+  mode: rvc_v2
