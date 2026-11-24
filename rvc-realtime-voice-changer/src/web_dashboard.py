@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import traceback
@@ -26,6 +27,9 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+# Set by the --daemon re-exec child so we don't spawn forever.
+_DAEMON_INNER_ENV = "RVC_DASHBOARD_DAEMON_INNER"
 
 from .realtime_vc import (
     DEFAULT_BLOCK,
@@ -624,15 +628,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._json(404, {"error": "Not found"})
 
 
-def _daemonize(pid_path: Path) -> None:
-    """Double-fork so the dashboard survives the launching shell exiting."""
-    if os.fork() > 0:
-        os._exit(0)
-    os.setsid()
-    if os.fork() > 0:
-        os._exit(0)
+def _spawn_daemon(argv: list[str], pid_path: Path, log_path: Path) -> int:
+    """Re-exec in a new session so the server survives the launching shell.
+
+    Prefer subprocess+start_new_session over fork(): PortAudio/torch may already
+    have threads after import, and fork-after-threads is unsafe on macOS.
+    """
+    child_argv = [sys.executable, "-u", "-m", "src.web_dashboard", *argv]
+    # Strip --daemon so the child runs the server; keep other flags.
+    child_argv = [a for a in child_argv if a != "--daemon"]
+    env = os.environ.copy()
+    env[_DAEMON_INNER_ENV] = "1"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_f = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 — kept for daemon lifetime
+    proc = subprocess.Popen(
+        child_argv,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=log_f,
+        stderr=log_f,
+        start_new_session=True,
+        cwd=str(ROOT),
+    )
     pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text(str(os.getpid()) + "\n", encoding="utf-8")
+    pid_path.write_text(str(proc.pid) + "\n", encoding="utf-8")
+    print(f"[dashboard] daemon started pid={proc.pid} log={log_path}", flush=True)
+    return 0
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -641,6 +662,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     port = PORT
     daemon = False
     pid_path = Path("/tmp/rvc-web-dashboard.pid")
+    log_path = Path("/tmp/rvc-web-dashboard.log")
     i = 0
     while i < len(args):
         if args[i] == "--host" and i + 1 < len(args):
@@ -655,12 +677,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         elif args[i] == "--pid-file" and i + 1 < len(args):
             pid_path = Path(args[i + 1])
             i += 2
+        elif args[i] == "--log-file" and i + 1 < len(args):
+            log_path = Path(args[i + 1])
+            i += 2
         else:
             print(f"Unknown arg: {args[i]}", file=sys.stderr)
             return 2
 
-    if daemon:
-        _daemonize(pid_path)
+    if daemon and os.environ.get(_DAEMON_INNER_ENV) != "1":
+        return _spawn_daemon(args, pid_path, log_path)
 
     # Warm device defaults into the log (no audio stream yet)
     log("[dashboard] Idle — waiting for Start in the browser")
