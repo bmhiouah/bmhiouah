@@ -1,0 +1,19 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Never commit voice model weights or indexes
+models/**
+!models/.gitkeep
+*.pth
+*.index
+*.onnx
+*.pt
+
+# Local overrides
+configs/local.yaml
+.env

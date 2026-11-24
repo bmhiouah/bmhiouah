@@ -1,0 +1,21 @@
+# Realtime RVC V2 starter config — edit paths locally; do not commit weights.
+
+audio:
+  sample_rate: 48000
+  # Smaller block → lower latency, higher CPU / underrun risk
+  block_size: 1024
+  channels: 1
+  # Leave null to use system default devices; or set integer device ids
+  input_device: null
+  output_device: null
+
+model:
+  # Relative to project root, or absolute path
+  path: models/YOUR_SPEAKER_v2.pth
+  index_path: null   # e.g. models/YOUR_SPEAKER_v2.index
+  # device: cpu | cuda | mps
+  device: cpu
+
+runtime:
+  # passthrough until real RVC wiring lands in infer_rvc_v2()
+  mode: passthrough
