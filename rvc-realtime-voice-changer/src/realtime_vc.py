@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -44,7 +45,8 @@ from .rvc_engine import (
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = os.environ.get("RVC_MODEL_PATH", str(DEFAULT_FRIDA_PTH.relative_to(ROOT)))
 DEFAULT_BLOCK = 4096  # larger blocks help RVC quality / CPU headroom
-AIRPODS_TOKENS = ("airpods", "airpod")
+# Prefer AirPods / EarPods for output when connected
+AIRPODS_TOKENS = ("airpods", "airpod", "earpods", "earpod")
 BUILTIN_MIC_TOKENS = (
     "built-in",
     "builtin",
@@ -163,8 +165,14 @@ def run_stream(
     block_size: int,
     input_device: Optional[int],
     output_device: Optional[int],
+    *,
+    stop_event: Optional[threading.Event] = None,
 ) -> None:
-    """Open a duplex stream: capture → RVC V2 → play."""
+    """Open a duplex stream: capture → RVC V2 → play.
+
+    Pass ``stop_event`` to allow a clean stop from another thread (web UI).
+    Without it, runs until KeyboardInterrupt / process kill.
+    """
     _require_sounddevice()
 
     # Stream at model SR so playback matches generator output without extra resample.
@@ -206,8 +214,115 @@ def run_stream(
         channels=1,
         callback=callback,
     ):
-        while True:
-            time.sleep(0.5)
+        if stop_event is None:
+            while True:
+                time.sleep(0.5)
+        else:
+            while not stop_event.is_set():
+                time.sleep(0.1)
+
+
+class RealtimeSession:
+    """Start/stop wrapper around ``load_rvc_v2`` + ``run_stream`` for the web UI."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._error: Optional[str] = None
+        self.running = False
+        self.model_path: Optional[str] = None
+        self.input_device: Optional[int] = None
+        self.output_device: Optional[int] = None
+        self.device: Optional[str] = None
+        self.block_size = DEFAULT_BLOCK
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "running": self.running,
+                "model_path": self.model_path,
+                "input_device": self.input_device,
+                "output_device": self.output_device,
+                "device": self.device,
+                "block_size": self.block_size,
+                "error": self._error,
+            }
+
+    def start(
+        self,
+        model_path: str | Path,
+        *,
+        index_path: Optional[str | Path] = None,
+        input_device: Optional[int] = None,
+        output_device: Optional[int] = None,
+        block_size: int = DEFAULT_BLOCK,
+        device: Optional[str] = None,
+        f0_up_key: int = 0,
+        index_rate: float = 0.5,
+    ) -> dict[str, Any]:
+        with self._lock:
+            if self.running:
+                raise RuntimeError("Already speaking — stop first")
+            self._error = None
+            self._stop.clear()
+            path = resolve_model_path(str(model_path))
+            self.model_path = str(path)
+            self.input_device = input_device
+            self.output_device = output_device
+            self.block_size = int(block_size)
+            self.device = device
+            self.running = True
+
+            def worker() -> None:
+                try:
+                    if "frida" in path.name.lower():
+                        ensure_frida_pth(path)
+                    if not path.is_file():
+                        raise FileNotFoundError(f"Model not found: {path}")
+                    model = load_rvc_v2(
+                        path,
+                        index_path=index_path,
+                        device=device,
+                        download_hubert=True,
+                        f0_up_key=f0_up_key,
+                        index_rate=index_rate,
+                    )
+                    in_dev, out_dev = auto_select_devices(input_device, output_device)
+                    with self._lock:
+                        self.input_device = in_dev
+                        self.output_device = out_dev
+                        self.device = str(model.get("device"))
+                    stream_sr = int(model["tgt_sr"])
+                    run_stream(
+                        model=model,
+                        sample_rate=stream_sr,
+                        block_size=self.block_size,
+                        input_device=in_dev,
+                        output_device=out_dev,
+                        stop_event=self._stop,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._error = str(exc)
+                    print(f"[session] {exc}", file=sys.stderr)
+                finally:
+                    with self._lock:
+                        self.running = False
+
+            self._thread = threading.Thread(target=worker, name="rvc-realtime", daemon=True)
+            self._thread.start()
+            return self.status()
+
+    def stop(self, timeout: float = 5.0) -> dict[str, Any]:
+        with self._lock:
+            self._stop.set()
+            thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+        with self._lock:
+            self.running = False
+            self._thread = None
+            return self.status()
 
 
 def dry_run(model_path: Path, *, download_hubert: bool = False) -> int:

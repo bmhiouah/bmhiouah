@@ -18,9 +18,13 @@ pip install -r requirements.txt
 # One-shot: resolve Frida + ContentVec, load weights, synthetic infer (no mic needed)
 python -m src.realtime_vc --dry-run --download-hubert
 
-# List devices, then run (AirPods out when present)
+# List devices, then run (AirPods/EarPods out when present)
 python -m src.realtime_vc --list-devices
 python -m src.realtime_vc
+
+# Browser dashboard (Start/Stop, voice + device pickers) — idle until Start
+python -m src.web_dashboard
+# → http://127.0.0.1:8765/
 ```
 
 On first real run the script will:
@@ -52,9 +56,23 @@ python -m src.realtime_vc --dry-run --download-hubert
 
 | Role | Policy |
 | --- | --- |
-| Output | Prefer a device whose name contains `AirPods` / `AirPod`; else system default |
-| Input | Prefer built-in / MacBook mic; else system default input (not AirPods mic) |
-| Override | `--input-device N --output-device M` or `--list-devices` |
+| Output | Prefer a device whose name contains `AirPods` / `EarPods`; else system default |
+| Input | Prefer built-in / MacBook mic; else system default input (not AirPods/EarPods mic) |
+| Override | `--input-device N --output-device M`, `--list-devices`, or the web dashboard |
+
+## Web dashboard
+
+```bash
+source .venv/bin/activate
+python -m src.web_dashboard          # http://127.0.0.1:8765/
+python -m src.web_dashboard --port 8765
+```
+
+- Select voice (models `*.zip` or extracted `.pth` under `models/_tmp/`)
+- Choose input (default: MacBook / built-in mic) and output (default: EarPods / AirPods)
+- **Start speaking** / **Stop** — the stream does not run until Start
+- Reuses `load_rvc_v2` / `infer_audio` / duplex loop from `src.realtime_vc`
+- Stdlib HTTP only (no FastAPI/Flask)
 
 ```bash
 python -m src.realtime_vc --list-devices
@@ -75,7 +93,8 @@ rvc-realtime-voice-changer/
     hubert/              # ContentVec (gitignored weights)
     _tmp/frida/          # extracted Frida .pth / .index
   src/
-    realtime_vc.py       # CLI + duplex loop + AirPods select
+    realtime_vc.py       # CLI + duplex loop + AirPods/EarPods select
+    web_dashboard.py     # Local browser UI (stdlib HTTP, Start/Stop)
     rvc_engine.py        # load + infer (16 kHz → model SR)
     rvc_pack/            # vendored RVC synthesizer (MIT, from rvc-python/RVC)
 ```
@@ -92,10 +111,11 @@ rvc-realtime-voice-changer/
 
 ## Status
 
-- [x] Realtime audio I/O + AirPods output auto-select
+- [x] Realtime audio I/O + AirPods/EarPods output auto-select
 - [x] Frida auto-unzip + ContentVec (lj1995) without fairseq
 - [x] Real RVC V2 infer (vendored synthesizer pack)
 - [x] `--dry-run` for headless import/path checks
+- [x] Local web dashboard (Start/Stop, voice + devices)
 - [ ] SOLA / crossfade low-latency tuning
 - [ ] YAML config auto-load
 - [ ] WhatsApp / virtual-cable routing
