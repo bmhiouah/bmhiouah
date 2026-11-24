@@ -9,6 +9,7 @@ Does not speak until you press Start.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import threading
@@ -19,6 +20,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
+
+# Limit OpenMP threads early — libomp SIGSEGVs were seen during RVC infer on this Mac.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 from .realtime_vc import (
     DEFAULT_BLOCK,
@@ -617,10 +624,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._json(404, {"error": "Not found"})
 
 
+def _daemonize(pid_path: Path) -> None:
+    """Double-fork so the dashboard survives the launching shell exiting."""
+    if os.fork() > 0:
+        os._exit(0)
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(str(os.getpid()) + "\n", encoding="utf-8")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = argv if argv is not None else sys.argv[1:]
     host = HOST
     port = PORT
+    daemon = False
+    pid_path = Path("/tmp/rvc-web-dashboard.pid")
     i = 0
     while i < len(args):
         if args[i] == "--host" and i + 1 < len(args):
@@ -629,9 +649,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         elif args[i] == "--port" and i + 1 < len(args):
             port = int(args[i + 1])
             i += 2
+        elif args[i] == "--daemon":
+            daemon = True
+            i += 1
+        elif args[i] == "--pid-file" and i + 1 < len(args):
+            pid_path = Path(args[i + 1])
+            i += 2
         else:
             print(f"Unknown arg: {args[i]}", file=sys.stderr)
             return 2
+
+    if daemon:
+        _daemonize(pid_path)
 
     # Warm device defaults into the log (no audio stream yet)
     log("[dashboard] Idle — waiting for Start in the browser")
@@ -653,7 +682,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     url = f"http://{host}:{port}/"
-    log(f"[dashboard] Serving {url}")
+    log(f"[dashboard] Serving {url} pid={os.getpid()} daemon={daemon}")
     log("[dashboard] Press Ctrl+C to quit")
     try:
         server.serve_forever()

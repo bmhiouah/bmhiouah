@@ -367,6 +367,11 @@ def _audio_worker_main(
     stop_event: Any,
 ) -> None:
     """Child process entry: load RVC + run streams. Crashes here leave the dashboard alive."""
+    # OpenMP (libomp) SIGSEGV'd during earlier infer runs; keep single-threaded.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
     try:
         path = Path(model_path)
         if "frida" in path.name.lower():
