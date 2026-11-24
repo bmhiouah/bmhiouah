@@ -18,7 +18,6 @@ import os
 import sys
 import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -264,18 +263,7 @@ def run_stream(
     # Blocking read/write (not a PortAudio callback): RVC on CPU can take longer
     # than one block; a callback would stall PortAudio and hang Stop.
 
-    stats = {"n": 0, "peak_in": 0.0, "peak_out": 0.0, "errors": 0}
-    heartbeat_every_s = 3.0
-    last_heartbeat = 0.0
-
-    def _heartbeat(mic_open: bool, note: str = "") -> None:
-        ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-        extra = f" {note}" if note else ""
-        print(
-            f"[heartbeat] {ts} alive=1 mic_open={1 if mic_open else 0} "
-            f"chunks={stats['n']} errors={stats['errors']}{extra}",
-            flush=True,
-        )
+    stats = {"n": 0, "peak_in": 0.0, "peak_out": 0.0}
 
     print(
         f"[audio] streams {stream_sr} Hz (model {model_sr} Hz), block={block_size}, "
@@ -312,12 +300,9 @@ def run_stream(
                 f"out={_device_name(output_device) if output_device is not None else 'default'}",
                 flush=True,
             )
-            _heartbeat(True, "stream_start")
-            last_heartbeat = time.monotonic()
             while stop_event is None or not stop_event.is_set():
                 indata, overflowed = istream.read(block_size)
                 if overflowed:
-                    stats["errors"] += 1
                     print(f"[audio] input overflow={overflowed}", file=sys.stderr, flush=True)
                 mono = np.asarray(indata[:, 0], dtype=np.float32)
                 t0 = time.perf_counter()
@@ -329,7 +314,6 @@ def run_stream(
                     if converted.shape[0] != block_size:
                         converted = _match_length(converted, block_size)
                 except Exception as exc:  # noqa: BLE001
-                    stats["errors"] += 1
                     print(f"[infer] {exc}", file=sys.stderr, flush=True)
                     converted = mono
                 infer_ms = (time.perf_counter() - t0) * 1000.0
@@ -340,7 +324,6 @@ def run_stream(
                     outdata[:, 1] = converted
                 under = ostream.write(outdata)
                 if under:
-                    stats["errors"] += 1
                     print(f"[audio] output underflow={under}", file=sys.stderr, flush=True)
 
                 rms_in = float(np.sqrt(np.mean(np.square(mono)))) if mono.size else 0.0
@@ -358,19 +341,12 @@ def run_stream(
                         f"infer_ms={infer_ms:.0f}",
                         flush=True,
                     )
-                now = time.monotonic()
-                if now - last_heartbeat >= heartbeat_every_s:
-                    _heartbeat(bool(istream.active), f"out_open={1 if ostream.active else 0}")
-                    last_heartbeat = now
-            _heartbeat(False, "stream_stop")
             print(
                 f"[audio] duplex CLOSED after {stats['n']} blocks "
                 f"peak_in={stats['peak_in']:.5f} peak_out={stats['peak_out']:.5f}",
                 flush=True,
             )
     except Exception as exc:  # noqa: BLE001
-        stats["errors"] += 1
-        _heartbeat(False, f"fatal={exc}")
         print(f"[audio] Stream open/run failed: {exc}", file=sys.stderr, flush=True)
         raise
 
