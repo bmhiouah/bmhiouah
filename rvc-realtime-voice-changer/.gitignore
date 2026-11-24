@@ -1,0 +1,31 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Local extract / cache under models (INDEX.md + shipped zips are tracked)
+models/_tmp/
+models/hubert/
+models/**/*.pth
+models/**/*.index
+models/**/*.onnx
+models/**/*.pt
+models/**/*.bin
+models/**/*.safetensors
+# Still ignore loose weights outside models/
+*.pth
+*.index
+*.onnx
+*.pt
+# Allow committed zip bundles under models/
+!models/*.zip
+!models/INDEX.md
+!models/.gitkeep
+!models/README.md
+
+# Local overrides
+configs/local.yaml
+.env

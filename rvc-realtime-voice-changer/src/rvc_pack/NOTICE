@@ -1,0 +1,5 @@
+Vendored RVC synthesizer pack (attentions, commons, models, modules, transforms).
+
+Derived from daswer123/rvc-python (MIT), itself based on
+RVC-Project/Retrieval-based-Voice-Conversion-WebUI infer_pack.
+Imports rewritten for this package (`src.rvc_pack`).
