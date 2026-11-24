@@ -3,12 +3,15 @@
 audio:
   # Stream defaults to the model sample rate (Frida = 40000). Override via --sr.
   sample_rate: 40000
-  # Larger blocks → more stable RVC on CPU; smaller → lower latency / more underruns
-  block_size: 16384
+  # Larger blocks → more stable RVC F0 + CPU headroom (~427 ms @ 48 kHz)
+  block_size: 20480
   channels: 1
   # Leave null for auto: AirPods output when connected; built-in/default mic for input
   input_device: null
   output_device: null
+  rms_gain: 1.25
+  crossfade: 768
+  silence_rms: 0.004
 
 model:
   # Relative to project root, or absolute path
@@ -26,6 +29,7 @@ model:
   # 0 = skip FAISS (IVF search has segfaulted with faiss-cpu on macOS/numpy2)
   index_rate: 0
   f0_up_key: 0
+  protect: 0.33
 
 runtime:
   mode: rvc_v2

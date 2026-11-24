@@ -48,12 +48,21 @@ from .rvc_engine import (
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = os.environ.get("RVC_MODEL_PATH", str(DEFAULT_FRIDA_PTH.relative_to(ROOT)))
-# Larger blocks give RVC headroom on CPU and avoid PortAudio underruns.
-DEFAULT_BLOCK = 16384
+# Larger blocks give RVC headroom on CPU (infer ~200–300 ms) and avoid underruns.
+# 20480 @ 48 kHz ≈ 427 ms of audio — enough margin without feeling sluggish.
+DEFAULT_BLOCK = int(os.environ.get("RVC_BLOCK_SIZE", "20480"))
 # Realtime defaults to CPU — MPS can segfault / stall inside the audio callback.
 DEFAULT_TORCH_DEVICE = os.environ.get("RVC_TORCH_DEVICE", "cpu")
 # FAISS IVF search has segfaulted on this Mac (faiss-cpu + numpy); skip by default.
 DEFAULT_INDEX_RATE = float(os.environ.get("RVC_INDEX_RATE", "0"))
+# Pitch shift (semitones). 0 = keep speaker pitch contour; +12 for male→feminine often.
+DEFAULT_F0_UP_KEY = int(os.environ.get("RVC_F0_UP_KEY", "0"))
+# Output loudness vs input RMS (RVC often comes out quieter than the mic).
+DEFAULT_RMS_GAIN = float(os.environ.get("RVC_RMS_GAIN", "1.25"))
+# Crossfade samples between consecutive converted blocks (click reduction).
+DEFAULT_CROSSFADE = int(os.environ.get("RVC_CROSSFADE", "768"))
+# Below this input RMS, skip RVC (emit silence) to avoid noise hallucination.
+SILENCE_RMS = float(os.environ.get("RVC_SILENCE_RMS", "0.004"))
 # Prefer a CoreAudio-native rate for mic/EarPods; RVC still runs at model SR via resample.
 PREFERRED_STREAM_RATES = (48000, 44100, 40000, 32000, 16000)
 # Prefer AirPods / EarPods for output when connected
@@ -101,11 +110,14 @@ def _device_name(index: int) -> str:
 def auto_select_devices(
     input_device: Optional[int],
     output_device: Optional[int],
+    *,
+    quiet: bool = False,
 ) -> tuple[Optional[int], Optional[int]]:
     """
     Prefer AirPods for *output* when connected; keep input on default/built-in mic.
 
     Explicit ``--input-device`` / ``--output-device`` always win.
+    Pass ``quiet=True`` from the dashboard poll path to avoid log spam.
     """
     if input_device is not None and output_device is not None:
         return input_device, output_device
@@ -116,7 +128,8 @@ def auto_select_devices(
         devices = sd.query_devices()
         default_in, default_out = sd.default.device
     except Exception as exc:  # noqa: BLE001
-        print(f"[audio] Device query failed ({exc}); using explicit/defaults only")
+        if not quiet:
+            print(f"[audio] Device query failed ({exc}); using explicit/defaults only")
         return input_device, output_device
 
     if not isinstance(default_in, int):
@@ -141,10 +154,11 @@ def auto_select_devices(
     chosen_out = output_device
     if chosen_out is None:
         chosen_out = airpods_out if airpods_out is not None else default_out
-        if airpods_out is not None:
-            print(f"[audio] AirPods output → {_device_name(airpods_out)} (id={airpods_out})")
-        elif chosen_out is not None:
-            print(f"[audio] Default output → {_device_name(chosen_out)} (id={chosen_out})")
+        if not quiet:
+            if airpods_out is not None:
+                print(f"[audio] AirPods output → {_device_name(airpods_out)} (id={airpods_out})")
+            elif chosen_out is not None:
+                print(f"[audio] Default output → {_device_name(chosen_out)} (id={chosen_out})")
 
     chosen_in = input_device
     if chosen_in is None:
@@ -154,9 +168,47 @@ def auto_select_devices(
             in_name = _device_name(chosen_in).lower()
             if any(t in in_name for t in AIRPODS_TOKENS) and builtin_in is not None:
                 chosen_in = builtin_in
-            print(f"[audio] Input mic → {_device_name(chosen_in)} (id={chosen_in})")
+            if not quiet:
+                print(f"[audio] Input mic → {_device_name(chosen_in)} (id={chosen_in})")
 
     return chosen_in, chosen_out
+
+
+def _rms(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+    if x.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(x))))
+
+
+def _match_rms(audio: np.ndarray, ref_rms: float, *, gain: float = 1.0) -> np.ndarray:
+    """Scale ``audio`` so its RMS ≈ ``ref_rms * gain`` (clamped to avoid clipping)."""
+    y = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if y.size == 0:
+        return y
+    cur = _rms(y)
+    target = max(0.0, float(ref_rms) * float(gain))
+    if cur < 1e-8 or target < 1e-8:
+        return y
+    scale = target / cur
+    y = y * scale
+    peak = float(np.max(np.abs(y)))
+    if peak > 0.98:
+        y = y * (0.98 / peak)
+    return y.astype(np.float32)
+
+
+def _crossfade(prev_tail: Optional[np.ndarray], block: np.ndarray, fade: int) -> tuple[np.ndarray, np.ndarray]:
+    """Linear crossfade of ``fade`` samples with the previous block's tail."""
+    x = np.asarray(block, dtype=np.float32).reshape(-1)
+    if fade <= 0 or prev_tail is None or prev_tail.size == 0 or x.size < fade:
+        tail = x[-fade:].copy() if fade > 0 and x.size >= fade else x.copy()
+        return x, tail
+    n = min(fade, prev_tail.size, x.size)
+    out = x.copy()
+    w = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    out[:n] = prev_tail[-n:] * (1.0 - w) + out[:n] * w
+    return out, out[-fade:].copy()
 
 
 def _match_length(audio: np.ndarray, frames: int) -> np.ndarray:
@@ -268,11 +320,15 @@ def run_stream(
     # than one block; a callback would stall PortAudio and hang Stop.
 
     stats = {"n": 0, "peak_in": 0.0, "peak_out": 0.0}
+    rms_gain = float(model.get("rms_gain", DEFAULT_RMS_GAIN))
+    crossfade_n = max(0, int(model.get("crossfade", DEFAULT_CROSSFADE)))
+    silence_rms = float(model.get("silence_rms", SILENCE_RMS))
+    prev_tail: Optional[np.ndarray] = None
 
     print(
         f"[audio] streams {stream_sr} Hz (model {model_sr} Hz), block={block_size}, "
         f"channels=({in_ch},{out_ch}), in={input_device}, out={output_device} "
-        f"— Ctrl+C to stop",
+        f"rms_gain={rms_gain} xfade={crossfade_n} — Ctrl+C to stop",
         flush=True,
     )
     if engine is not None:
@@ -309,17 +365,26 @@ def run_stream(
                 if overflowed:
                     print(f"[audio] input overflow={overflowed}", file=sys.stderr, flush=True)
                 mono = np.asarray(indata[:, 0], dtype=np.float32)
+                rms_in = _rms(mono)
                 t0 = time.perf_counter()
                 try:
-                    converted = infer_audio(mono, model, stream_sr)
-                    # Model may emit at tgt_sr (e.g. 40 kHz); resample to stream SR.
-                    if int(model_sr) != int(stream_sr):
-                        converted = _resample(converted, model_sr, stream_sr)
-                    if converted.shape[0] != block_size:
-                        converted = _match_length(converted, block_size)
+                    if rms_in < silence_rms:
+                        # Near-silence: skip RVC (avoids hiss / hallucinated consonants).
+                        converted = np.zeros(block_size, dtype=np.float32)
+                        prev_tail = None
+                    else:
+                        converted = infer_audio(mono, model, stream_sr)
+                        # Model may emit at tgt_sr (e.g. 40 kHz); resample to stream SR.
+                        if int(model_sr) != int(stream_sr):
+                            converted = _resample(converted, model_sr, stream_sr)
+                        if converted.shape[0] != block_size:
+                            converted = _match_length(converted, block_size)
+                        converted = _match_rms(converted, rms_in, gain=rms_gain)
+                        converted, prev_tail = _crossfade(prev_tail, converted, crossfade_n)
                 except Exception as exc:  # noqa: BLE001
                     print(f"[infer] {exc}", file=sys.stderr, flush=True)
                     converted = mono
+                    prev_tail = None
                 infer_ms = (time.perf_counter() - t0) * 1000.0
 
                 outdata = np.zeros((block_size, out_ch), dtype=np.float32)
@@ -330,10 +395,7 @@ def run_stream(
                 if under:
                     print(f"[audio] output underflow={under}", file=sys.stderr, flush=True)
 
-                rms_in = float(np.sqrt(np.mean(np.square(mono)))) if mono.size else 0.0
-                rms_out = (
-                    float(np.sqrt(np.mean(np.square(converted)))) if converted.size else 0.0
-                )
+                rms_out = _rms(converted)
                 stats["n"] += 1
                 stats["peak_in"] = max(stats["peak_in"], rms_in)
                 stats["peak_out"] = max(stats["peak_out"], rms_out)
@@ -364,6 +426,8 @@ def _audio_worker_main(
     device: str,
     f0_up_key: int,
     index_rate: float,
+    rms_gain: float,
+    protect: float,
     stop_event: Any,
 ) -> None:
     """Child process entry: load RVC + run streams. Crashes here leave the dashboard alive."""
@@ -373,13 +437,26 @@ def _audio_worker_main(
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
     try:
+        import torch
+
+        torch.set_num_threads(1)
+        if hasattr(torch, "set_num_interop_threads"):
+            try:
+                torch.set_num_interop_threads(1)
+            except RuntimeError:
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         path = Path(model_path)
         if "frida" in path.name.lower():
             ensure_frida_pth(path)
         if not path.is_file():
             raise FileNotFoundError(f"Model not found: {path}")
         print(
-            f"[session] Loading RVC on {device} (block={block_size}, index_rate={index_rate})…",
+            f"[session] Loading RVC on {device} "
+            f"(block={block_size}, index_rate={index_rate}, f0={f0_up_key}, "
+            f"protect={protect}, rms_gain={rms_gain})…",
             flush=True,
         )
         model = load_rvc_v2(
@@ -389,7 +466,11 @@ def _audio_worker_main(
             download_hubert=True,
             f0_up_key=f0_up_key,
             index_rate=index_rate,
+            protect=protect,
         )
+        model["rms_gain"] = float(rms_gain)
+        model["crossfade"] = DEFAULT_CROSSFADE
+        model["silence_rms"] = SILENCE_RMS
         in_dev, out_dev = auto_select_devices(input_device, output_device)
         stream_sr = int(model["tgt_sr"])
         print(
@@ -425,6 +506,7 @@ class RealtimeSession:
         self._error: Optional[str] = None
         self.running = False
         self.model_path: Optional[str] = None
+        self.voice_id: Optional[str] = None
         self.input_device: Optional[int] = None
         self.output_device: Optional[int] = None
         self.device: Optional[str] = None
@@ -435,6 +517,7 @@ class RealtimeSession:
             return {
                 "running": self.running,
                 "model_path": self.model_path,
+                "voice_id": self.voice_id,
                 "input_device": self.input_device,
                 "output_device": self.output_device,
                 "device": self.device,
@@ -451,8 +534,11 @@ class RealtimeSession:
         output_device: Optional[int] = None,
         block_size: int = DEFAULT_BLOCK,
         device: Optional[str] = None,
-        f0_up_key: int = 0,
+        f0_up_key: int = DEFAULT_F0_UP_KEY,
         index_rate: float = DEFAULT_INDEX_RATE,
+        rms_gain: float = DEFAULT_RMS_GAIN,
+        protect: float = 0.33,
+        voice_id: Optional[str] = None,
     ) -> dict[str, Any]:
         # IMPORTANT: never call status() while holding this lock (non-reentrant).
         torch_device = device or DEFAULT_TORCH_DEVICE
@@ -465,6 +551,7 @@ class RealtimeSession:
                 raise RuntimeError("Already speaking — stop first")
             self._error = None
             self.model_path = str(path)
+            self.voice_id = voice_id
             self.input_device = input_device
             self.output_device = output_device
             self.block_size = int(block_size)
@@ -484,6 +571,8 @@ class RealtimeSession:
                     torch_device,
                     int(f0_up_key),
                     use_index_rate,
+                    float(rms_gain),
+                    float(protect),
                     stop_event,
                 ),
                 daemon=True,
@@ -623,12 +712,29 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=DEFAULT_TORCH_DEVICE,
         help="Torch device: cpu | mps | cuda (default: cpu for realtime stability)",
     )
-    p.add_argument("--f0-up-key", type=int, default=0, help="Pitch shift in semitones")
+    p.add_argument(
+        "--f0-up-key",
+        type=int,
+        default=DEFAULT_F0_UP_KEY,
+        help="Pitch shift in semitones (0=keep contour; +12 often for male→feminine)",
+    )
     p.add_argument(
         "--index-rate",
         type=float,
         default=DEFAULT_INDEX_RATE,
         help="FAISS blend rate 0..1 (default 0 — IVF search can segfault on macOS)",
+    )
+    p.add_argument(
+        "--rms-gain",
+        type=float,
+        default=DEFAULT_RMS_GAIN,
+        help="Output RMS relative to input (default 1.25)",
+    )
+    p.add_argument(
+        "--protect",
+        type=float,
+        default=0.33,
+        help="Consonant protect 0..0.5 (RVC; lower = more protect)",
     )
     p.add_argument(
         "--dry-run",
@@ -668,7 +774,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             download_hubert=True,
             f0_up_key=args.f0_up_key,
             index_rate=args.index_rate,
+            protect=args.protect,
         )
+        model["rms_gain"] = float(args.rms_gain)
+        model["crossfade"] = DEFAULT_CROSSFADE
+        model["silence_rms"] = SILENCE_RMS
     except Exception as exc:  # noqa: BLE001
         print(f"[model] Failed to load RVC: {exc}", file=sys.stderr)
         return 1

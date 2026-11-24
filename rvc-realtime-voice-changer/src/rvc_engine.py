@@ -415,6 +415,9 @@ class RVCModel:
         peak = float(np.max(np.abs(x))) if x.size else 0.0
         if peak > 1.0:
             x = x / peak
+        elif 1e-4 < peak < 0.25:
+            # Quiet mic → bring level into a range RVC converts more cleanly.
+            x = x * min(0.9 / peak, 4.0)
 
         audio_16k = _resample(x, input_sr, HUBERT_SR)
         # light DC / rumble cut like upstream
@@ -430,6 +433,8 @@ class RVCModel:
         phone = out.hidden_states[layer]
         if self.version == "v1" and hasattr(self.hubert, "final_proj"):
             phone = self.hubert.final_proj(phone)
+
+        phone0 = phone.clone()  # pre-index features for consonant protect
 
         if self.index is not None and self.big_npy is not None and self.index_rate != 0:
             # faiss-cpu IVF search has segfaulted on some macOS/numpy stacks —
@@ -454,16 +459,26 @@ class RVCModel:
 
         # ~50 Hz → ~100 Hz content rate
         phone = F.interpolate(phone.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
+        phone0 = F.interpolate(phone0.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
 
         p_len = audio_16k.shape[0] // WINDOW
         if phone.shape[1] < p_len:
             p_len = phone.shape[1]
         phone = phone[:, :p_len, :]
+        phone0 = phone0[:, :p_len, :]
         phone_lengths = torch.tensor([p_len], device=self.device).long()
         sid = torch.tensor([self.sid], device=self.device).long()
 
         if self.if_f0 == 1:
             pitch, pitchf = _f0_pm(audio_16k, p_len, self.f0_up_key)
+            # RVC "protect": blend original ContentVec on unvoiced/consonant frames
+            # so plosives/fricatives stay clearer (protect < 0.5 enables).
+            if self.protect < 0.5:
+                pitchff = pitchf[:p_len].astype(np.float32).copy()
+                pitchff[pitchff > 0] = 1.0
+                pitchff[pitchff < 1.0] = float(self.protect)
+                w = torch.from_numpy(pitchff).to(self.device).view(1, p_len, 1)
+                phone = phone * w + phone0 * (1.0 - w)
             pitch_t = torch.from_numpy(pitch[:p_len]).unsqueeze(0).long().to(self.device)
             pitchf_t = (
                 torch.from_numpy(pitchf[:p_len]).unsqueeze(0).float().to(self.device)

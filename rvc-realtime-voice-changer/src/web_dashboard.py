@@ -33,6 +33,9 @@ _DAEMON_INNER_ENV = "RVC_DASHBOARD_DAEMON_INNER"
 
 from .realtime_vc import (
     DEFAULT_BLOCK,
+    DEFAULT_F0_UP_KEY,
+    DEFAULT_INDEX_RATE,
+    DEFAULT_RMS_GAIN,
     ROOT,
     RealtimeSession,
     auto_select_devices,
@@ -48,6 +51,11 @@ HOST = "127.0.0.1"
 PORT = 8765
 MODELS_DIR = ROOT / "models"
 TMP_DIR = MODELS_DIR / "_tmp"
+# Cache heavy catalog endpoints so 2–4s UI polls stay cheap.
+_CATALOG_TTL_S = 20.0
+_voices_cache: dict[str, Any] = {"t": 0.0, "payload": None}
+_devices_cache: dict[str, Any] = {"t": 0.0, "payload": None}
+_cache_lock = threading.Lock()
 
 _session = RealtimeSession()
 _log: deque[str] = deque(maxlen=200)
@@ -209,7 +217,19 @@ def resolve_voice(voice_id: str) -> tuple[Path, Optional[Path]]:
     return pth, _find_index_near(pth)
 
 
-def list_audio_devices() -> dict[str, Any]:
+def list_audio_devices(*, force: bool = False) -> dict[str, Any]:
+    import time as _time
+
+    now = _time.monotonic()
+    with _cache_lock:
+        cached = _devices_cache.get("payload")
+        if (
+            not force
+            and cached is not None
+            and (now - float(_devices_cache.get("t") or 0.0)) < _CATALOG_TTL_S
+        ):
+            return cached
+
     if sd is None:
         return {
             "ok": False,
@@ -252,9 +272,9 @@ def list_audio_devices() -> dict[str, Any]:
             }
         )
 
-    suggested_in, suggested_out = auto_select_devices(None, None)
-    # Prefer MacBook / built-in mic and EarPods / AirPods out (auto_select already does this)
-    return {
+    # quiet=True — dashboard polls this; printing every time flooded the log + UI.
+    suggested_in, suggested_out = auto_select_devices(None, None, quiet=True)
+    payload = {
         "ok": True,
         "devices": devices,
         "system_default_input": default_in,
@@ -262,6 +282,29 @@ def list_audio_devices() -> dict[str, Any]:
         "default_input": suggested_in,
         "default_output": suggested_out,
     }
+    with _cache_lock:
+        _devices_cache["t"] = now
+        _devices_cache["payload"] = payload
+    return payload
+
+
+def list_voices_cached(*, force: bool = False) -> list[dict[str, Any]]:
+    import time as _time
+
+    now = _time.monotonic()
+    with _cache_lock:
+        cached = _voices_cache.get("payload")
+        if (
+            not force
+            and cached is not None
+            and (now - float(_voices_cache.get("t") or 0.0)) < _CATALOG_TTL_S
+        ):
+            return cached
+    voices = discover_voices()
+    with _cache_lock:
+        _voices_cache["t"] = now
+        _voices_cache["payload"] = voices
+    return voices
 
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -417,7 +460,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <span id="status-text">Idle — not speaking</span>
     </div>
     <div id="log" aria-live="polite"></div>
-    <p class="hint">Server: http://127.0.0.1:8765 · English UI only · uses existing realtime pipeline</p>
+    <p class="hint">Server: http://127.0.0.1:8765 · Voice list from models/*.zip + models/_tmp · RVC V2 (not TTS)</p>
   </main>
   <script>
     const voiceEl = document.getElementById("voice");
@@ -428,6 +471,13 @@ HTML_PAGE = """<!DOCTYPE html>
     const statusText = document.getElementById("status-text");
     const dot = document.getElementById("dot");
     const logEl = document.getElementById("log");
+
+    // Lag fix: catalog (voices/devices) loaded once; light poll only status+logs.
+    // Never rebuild <select>s on every tick (that was the main UI jank).
+    const POLL_MS = 4000;
+    let catalogReady = false;
+    let lastLogText = "";
+    let pollBusy = false;
 
     function setRunning(on, err) {
       btnStart.disabled = on;
@@ -450,36 +500,55 @@ HTML_PAGE = """<!DOCTYPE html>
       return data;
     }
 
-    function fillSelect(el, items, valueKey, labelFn, selected) {
+    function fillSelect(el, items, valueKey, labelFn, selected, disabledFn) {
+      const prev = el.value;
       el.innerHTML = "";
       for (const item of items) {
         const opt = document.createElement("option");
         opt.value = String(item[valueKey]);
         opt.textContent = labelFn(item);
-        if (selected != null && String(item[valueKey]) === String(selected)) {
-          opt.selected = true;
-        }
+        if (disabledFn && disabledFn(item)) opt.disabled = true;
         el.appendChild(opt);
+      }
+      const want = selected != null ? String(selected) : (prev || "");
+      if (want && [...el.options].some((o) => o.value === want && !o.disabled)) {
+        el.value = want;
+      } else {
+        const firstOk = [...el.options].find((o) => !o.disabled);
+        if (firstOk) el.value = firstOk.value;
       }
     }
 
-    async function refresh() {
-      const [voices, devices, status, logs] = await Promise.all([
+    function applyStatus(status) {
+      setRunning(!!status.running, status.error || null);
+    }
+
+    function applyLogs(logs) {
+      const text = (logs.lines || []).join("\\n");
+      if (text === lastLogText) return;
+      const nearBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+      lastLogText = text;
+      logEl.textContent = text;
+      if (nearBottom) logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    async function loadCatalog(statusHint) {
+      const [voices, devices, status] = await Promise.all([
         api("/api/voices"),
         api("/api/devices"),
-        api("/api/status"),
-        api("/api/logs"),
+        statusHint ? Promise.resolve(statusHint) : api("/api/status"),
       ]);
       fillSelect(
         voiceEl,
         voices.voices || [],
         "id",
         (v) => {
-          const tag = v.ready ? "" : " (unavailable)";
+          const tag = v.ready ? "" : " (unavailable — git lfs)";
           const kind = v.kind === "zip" ? "zip" : "pth";
           return `${v.name} [${kind}]${tag}`;
         },
-        status.voice_id || null
+        status.voice_id || null,
+        (v) => !v.ready
       );
       const inputs = (devices.devices || []).filter((d) => d.is_input);
       const outputs = (devices.devices || []).filter((d) => d.is_output);
@@ -497,12 +566,32 @@ HTML_PAGE = """<!DOCTYPE html>
         (d) => `${d.id}: ${d.name}`,
         status.output_device != null ? status.output_device : devices.default_output
       );
-      setRunning(!!status.running, status.error || null);
-      logEl.textContent = (logs.lines || []).join("\\n");
-      logEl.scrollTop = logEl.scrollHeight;
+      applyStatus(status);
+      catalogReady = true;
+    }
+
+    async function pollLight() {
+      if (pollBusy) return;
+      pollBusy = true;
+      try {
+        const [status, logs] = await Promise.all([
+          api("/api/status"),
+          api("/api/logs"),
+        ]);
+        applyStatus(status);
+        applyLogs(logs);
+      } catch (e) {
+        /* keep last UI state if server briefly unreachable */
+      } finally {
+        pollBusy = false;
+      }
     }
 
     btnStart.addEventListener("click", async () => {
+      if (!voiceEl.value) {
+        setRunning(false, "No voice selected");
+        return;
+      }
       setRunning(true, null);
       try {
         await api("/api/start", {
@@ -517,7 +606,7 @@ HTML_PAGE = """<!DOCTYPE html>
       } catch (e) {
         setRunning(false, e.message);
       }
-      await refresh();
+      await pollLight();
     });
 
     btnStop.addEventListener("click", async () => {
@@ -526,11 +615,19 @@ HTML_PAGE = """<!DOCTYPE html>
       } catch (e) {
         statusText.textContent = "Stop failed: " + e.message;
       }
-      await refresh();
+      await pollLight();
     });
 
-    refresh();
-    setInterval(refresh, 2000);
+    (async () => {
+      try {
+        await loadCatalog();
+        const logs = await api("/api/logs");
+        applyLogs(logs);
+      } catch (e) {
+        setRunning(false, e.message || String(e));
+      }
+      setInterval(pollLight, POLL_MS);
+    })();
   </script>
 </body>
 </html>
@@ -573,7 +670,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send(200, body, "text/html; charset=utf-8")
             return
         if path == "/api/voices":
-            self._json(200, {"voices": discover_voices()})
+            self._json(200, {"voices": list_voices_cached()})
             return
         if path == "/api/devices":
             self._json(200, list_audio_devices())
@@ -602,16 +699,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 log(f"[ui] Start requested voice={voice_id} in={input_device} out={output_device}")
                 pth, idx = resolve_voice(voice_id)
                 log(f"[ui] Resolved model → {pth}")
+                # Quality path: larger block, CPU, protect consonants, RMS match.
+                # index_rate stays 0 — FAISS IVF search segfaults on this Mac stack.
                 st = _session.start(
                     pth,
                     index_path=idx,
                     input_device=input_device,
                     output_device=output_device,
                     block_size=DEFAULT_BLOCK,
-                    device="cpu",  # avoid MPS stalls/segfaults in the audio path
-                    index_rate=0.0,  # FAISS IVF search segfaults on this Mac stack
+                    device="cpu",
+                    f0_up_key=DEFAULT_F0_UP_KEY,
+                    index_rate=DEFAULT_INDEX_RATE,
+                    rms_gain=DEFAULT_RMS_GAIN,
+                    protect=0.33,
+                    voice_id=voice_id,
                 )
-                st["voice_id"] = voice_id
                 self._json(200, st)
             except Exception as exc:  # noqa: BLE001
                 log(f"[ui] Start failed: {exc}")

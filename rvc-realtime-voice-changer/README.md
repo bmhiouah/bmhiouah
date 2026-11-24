@@ -64,13 +64,16 @@ python -m src.realtime_vc --dry-run --download-hubert
 
 ```bash
 source .venv/bin/activate
+python -m src.web_dashboard --daemon # survives shell exit; PID /tmp/rvc-web-dashboard.pid
+# or foreground:
 python -m src.web_dashboard          # http://127.0.0.1:8765/
-python -m src.web_dashboard --port 8765
 ```
 
-- Select voice (models `*.zip` or extracted `.pth` under `models/_tmp/`)
+- **Voice** dropdown lists every `models/*.zip` plus extracted `.pth` under `models/_tmp/` (unavailable LFS placeholders are disabled)
 - Choose input (default: MacBook / built-in mic) and output (default: EarPods / AirPods)
-- **Start speaking** / **Stop** — the stream does not run until Start
+- **Start speaking** / **Stop** — Start loads the *selected* RVC voice; stream idle until then
+- UI polls status/logs only (4s); voice/device catalogs load once (no full re-render spam)
+- Realtime quality: block 20480, CPU, protect=0.33, RMS gain 1.25, block crossfade (not TTS)
 - Reuses `load_rvc_v2` / `infer_audio` / duplex loop from `src.realtime_vc`
 - Stdlib HTTP only (no FastAPI/Flask)
 
