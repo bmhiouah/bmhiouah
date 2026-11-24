@@ -597,6 +597,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     input_device=input_device,
                     output_device=output_device,
                     block_size=DEFAULT_BLOCK,
+                    device="cpu",  # avoid MPS stalls/segfaults in the audio path
+                    index_rate=0.0,  # FAISS IVF search segfaults on this Mac stack
                 )
                 st["voice_id"] = voice_id
                 self._json(200, st)

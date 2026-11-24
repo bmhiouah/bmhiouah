@@ -18,6 +18,7 @@ import os
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -44,7 +45,14 @@ from .rvc_engine import (
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = os.environ.get("RVC_MODEL_PATH", str(DEFAULT_FRIDA_PTH.relative_to(ROOT)))
-DEFAULT_BLOCK = 4096  # larger blocks help RVC quality / CPU headroom
+# Larger blocks give RVC headroom on CPU and avoid PortAudio underruns.
+DEFAULT_BLOCK = 16384
+# Realtime defaults to CPU — MPS can segfault / stall inside the audio callback.
+DEFAULT_TORCH_DEVICE = os.environ.get("RVC_TORCH_DEVICE", "cpu")
+# FAISS IVF search has segfaulted on this Mac (faiss-cpu + numpy); skip by default.
+DEFAULT_INDEX_RATE = float(os.environ.get("RVC_INDEX_RATE", "0"))
+# Prefer a CoreAudio-native rate for mic/EarPods; RVC still runs at model SR via resample.
+PREFERRED_STREAM_RATES = (48000, 44100, 40000, 32000, 16000)
 # Prefer AirPods / EarPods for output when connected
 AIRPODS_TOKENS = ("airpods", "airpod", "earpods", "earpod")
 BUILTIN_MIC_TOKENS = (
@@ -159,6 +167,75 @@ def _match_length(audio: np.ndarray, frames: int) -> np.ndarray:
     return out
 
 
+def _stream_channel_counts(
+    input_device: Optional[int],
+    output_device: Optional[int],
+) -> tuple[int, int]:
+    """Mono mic in; up to stereo out so EarPods / AirPods get both channels."""
+    in_ch, out_ch = 1, 1
+    try:
+        if input_device is not None:
+            max_in = int(sd.query_devices(input_device)["max_input_channels"] or 0)
+            in_ch = 1 if max_in >= 1 else max(1, max_in)
+        if output_device is not None:
+            max_out = int(sd.query_devices(output_device)["max_output_channels"] or 0)
+            if max_out >= 2:
+                out_ch = 2
+            elif max_out >= 1:
+                out_ch = 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"[audio] Channel query fallback ({exc})", flush=True)
+    return in_ch, out_ch
+
+
+def _pick_stream_sample_rate(
+    input_device: Optional[int],
+    output_device: Optional[int],
+    preferred: Optional[int] = None,
+) -> int:
+    """Choose a sample rate both devices can open (EarPods often prefer 44100)."""
+    candidates: list[int] = []
+    if preferred:
+        candidates.append(int(preferred))
+    for dev in (input_device, output_device):
+        if dev is None:
+            continue
+        try:
+            rate = int(float(sd.query_devices(dev).get("default_samplerate") or 0))
+            if rate > 0:
+                candidates.append(rate)
+        except Exception:  # noqa: BLE001
+            pass
+    candidates.extend(PREFERRED_STREAM_RATES)
+    seen: set[int] = set()
+    ordered: list[int] = []
+    for rate in candidates:
+        if rate not in seen:
+            seen.add(rate)
+            ordered.append(rate)
+
+    in_ch, out_ch = _stream_channel_counts(input_device, output_device)
+    for rate in ordered:
+        try:
+            with sd.InputStream(
+                device=input_device,
+                samplerate=rate,
+                channels=in_ch,
+                dtype="float32",
+                blocksize=512,
+            ), sd.OutputStream(
+                device=output_device,
+                samplerate=rate,
+                channels=out_ch,
+                dtype="float32",
+                blocksize=512,
+            ):
+                return rate
+        except Exception:  # noqa: BLE001
+            continue
+    return ordered[0] if ordered else 48000
+
+
 def run_stream(
     model: dict[str, Any],
     sample_rate: int,
@@ -168,58 +245,134 @@ def run_stream(
     *,
     stop_event: Optional[threading.Event] = None,
 ) -> None:
-    """Open a duplex stream: capture → RVC V2 → play.
+    """Open separate capture/playback streams: mic → RVC V2 → speakers.
 
     Pass ``stop_event`` to allow a clean stop from another thread (web UI).
     Without it, runs until KeyboardInterrupt / process kill.
+
+    Uses separate InputStream/OutputStream (not one duplex Stream) because
+    mic + EarPods are different CoreAudio devices; blocking duplex read can hang.
     """
     _require_sounddevice()
 
-    # Stream at model SR so playback matches generator output without extra resample.
-    stream_sr = int(model.get("tgt_sr") or sample_rate)
-    engine = model.get("engine")
-    # Callback runs RVC on each block. For low latency on-device, raise --block-size.
+    from .rvc_engine import _resample  # local helper; keeps playback at stream SR
 
-    def callback(indata, outdata, frames, time_info, status):  # noqa: ARG001
-        if status:
-            print(f"[audio] {status}", file=sys.stderr)
-        mono = np.asarray(indata[:, 0], dtype=np.float32)
-        try:
-            # Resample stream_sr → 16 kHz inside engine, generate at tgt_sr
-            converted = infer_audio(mono, model, stream_sr)
-            # If lengths diverge (hop framing), fit to callback frames
-            if converted.shape[0] != frames:
-                # Ratio tgt_sr/stream_sr should be ~1 when stream_sr == tgt_sr
-                converted = _match_length(converted, frames)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[infer] {exc}", file=sys.stderr)
-            converted = mono
-        outdata[:, 0] = converted
+    model_sr = int(model.get("tgt_sr") or sample_rate)
+    stream_sr = _pick_stream_sample_rate(input_device, output_device, preferred=sample_rate)
+    engine = model.get("engine")
+    in_ch, out_ch = _stream_channel_counts(input_device, output_device)
+    # Blocking read/write (not a PortAudio callback): RVC on CPU can take longer
+    # than one block; a callback would stall PortAudio and hang Stop.
+
+    stats = {"n": 0, "peak_in": 0.0, "peak_out": 0.0, "errors": 0}
+    heartbeat_every_s = 3.0
+    last_heartbeat = 0.0
+
+    def _heartbeat(mic_open: bool, note: str = "") -> None:
+        ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        extra = f" {note}" if note else ""
+        print(
+            f"[heartbeat] {ts} alive=1 mic_open={1 if mic_open else 0} "
+            f"chunks={stats['n']} errors={stats['errors']}{extra}",
+            flush=True,
+        )
 
     print(
-        f"[audio] duplex {stream_sr} Hz, block={block_size}, "
-        f"in={input_device}, out={output_device} — Ctrl+C to stop"
+        f"[audio] streams {stream_sr} Hz (model {model_sr} Hz), block={block_size}, "
+        f"channels=({in_ch},{out_ch}), in={input_device}, out={output_device} "
+        f"— Ctrl+C to stop",
+        flush=True,
     )
     if engine is not None:
         print(
             f"[audio] RVC {model.get('version')} on {model.get('device')} "
-            f"(HuBERT @ {HUBERT_SR} Hz → out @ {model.get('tgt_sr')} Hz)"
+            f"(HuBERT @ {HUBERT_SR} Hz → model @ {model_sr} Hz → play @ {stream_sr} Hz)",
+            flush=True,
         )
 
-    with sd.Stream(
-        device=(input_device, output_device),
-        samplerate=stream_sr,
-        blocksize=block_size,
-        dtype="float32",
-        channels=1,
-        callback=callback,
-    ):
-        if stop_event is None:
-            while True:
-                time.sleep(0.5)
-        else:
-            while not stop_event.is_set():
-                time.sleep(0.1)
+    try:
+        with sd.InputStream(
+            device=input_device,
+            samplerate=stream_sr,
+            blocksize=block_size,
+            dtype="float32",
+            channels=in_ch,
+            latency="high",
+        ) as istream, sd.OutputStream(
+            device=output_device,
+            samplerate=stream_sr,
+            blocksize=block_size,
+            dtype="float32",
+            channels=out_ch,
+            latency="high",
+        ) as ostream:
+            print(
+                f"[audio] duplex OPEN active=({istream.active},{ostream.active}) "
+                f"in={_device_name(input_device) if input_device is not None else 'default'} "
+                f"out={_device_name(output_device) if output_device is not None else 'default'}",
+                flush=True,
+            )
+            _heartbeat(True, "stream_start")
+            last_heartbeat = time.monotonic()
+            while stop_event is None or not stop_event.is_set():
+                indata, overflowed = istream.read(block_size)
+                if overflowed:
+                    stats["errors"] += 1
+                    print(f"[audio] input overflow={overflowed}", file=sys.stderr, flush=True)
+                mono = np.asarray(indata[:, 0], dtype=np.float32)
+                t0 = time.perf_counter()
+                try:
+                    converted = infer_audio(mono, model, stream_sr)
+                    # Model may emit at tgt_sr (e.g. 40 kHz); resample to stream SR.
+                    if int(model_sr) != int(stream_sr):
+                        converted = _resample(converted, model_sr, stream_sr)
+                    if converted.shape[0] != block_size:
+                        converted = _match_length(converted, block_size)
+                except Exception as exc:  # noqa: BLE001
+                    stats["errors"] += 1
+                    print(f"[infer] {exc}", file=sys.stderr, flush=True)
+                    converted = mono
+                infer_ms = (time.perf_counter() - t0) * 1000.0
+
+                outdata = np.zeros((block_size, out_ch), dtype=np.float32)
+                outdata[:, 0] = converted
+                if out_ch > 1:
+                    outdata[:, 1] = converted
+                under = ostream.write(outdata)
+                if under:
+                    stats["errors"] += 1
+                    print(f"[audio] output underflow={under}", file=sys.stderr, flush=True)
+
+                rms_in = float(np.sqrt(np.mean(np.square(mono)))) if mono.size else 0.0
+                rms_out = (
+                    float(np.sqrt(np.mean(np.square(converted)))) if converted.size else 0.0
+                )
+                stats["n"] += 1
+                stats["peak_in"] = max(stats["peak_in"], rms_in)
+                stats["peak_out"] = max(stats["peak_out"], rms_out)
+                n = stats["n"]
+                if n <= 8 or n % 20 == 0:
+                    print(
+                        f"[audio] block={n} rms_in={rms_in:.5f} rms_out={rms_out:.5f} "
+                        f"peak_in={stats['peak_in']:.5f} peak_out={stats['peak_out']:.5f} "
+                        f"infer_ms={infer_ms:.0f}",
+                        flush=True,
+                    )
+                now = time.monotonic()
+                if now - last_heartbeat >= heartbeat_every_s:
+                    _heartbeat(bool(istream.active), f"out_open={1 if ostream.active else 0}")
+                    last_heartbeat = now
+            _heartbeat(False, "stream_stop")
+            print(
+                f"[audio] duplex CLOSED after {stats['n']} blocks "
+                f"peak_in={stats['peak_in']:.5f} peak_out={stats['peak_out']:.5f}",
+                flush=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        stats["errors"] += 1
+        _heartbeat(False, f"fatal={exc}")
+        print(f"[audio] Stream open/run failed: {exc}", file=sys.stderr, flush=True)
+        raise
 
 
 class RealtimeSession:
@@ -259,8 +412,15 @@ class RealtimeSession:
         block_size: int = DEFAULT_BLOCK,
         device: Optional[str] = None,
         f0_up_key: int = 0,
-        index_rate: float = 0.5,
+        index_rate: float = DEFAULT_INDEX_RATE,
     ) -> dict[str, Any]:
+        # IMPORTANT: never call status()/acquire this lock again while holding it —
+        # threading.Lock is not re-entrant and would deadlock Start + the worker
+        # before duplex ever opens (silent UI / hung /api/status).
+        torch_device = device or DEFAULT_TORCH_DEVICE
+        # Skip FAISS by default — IVF search segfaults with current faiss-cpu/numpy.
+        use_index_rate = float(index_rate)
+        use_index_path = index_path if use_index_rate > 0 else None
         with self._lock:
             if self.running:
                 raise RuntimeError("Already speaking — stop first")
@@ -271,7 +431,7 @@ class RealtimeSession:
             self.input_device = input_device
             self.output_device = output_device
             self.block_size = int(block_size)
-            self.device = device
+            self.device = torch_device
             self.running = True
 
             def worker() -> None:
@@ -280,13 +440,18 @@ class RealtimeSession:
                         ensure_frida_pth(path)
                     if not path.is_file():
                         raise FileNotFoundError(f"Model not found: {path}")
+                    print(
+                        f"[session] Loading RVC on {torch_device} "
+                        f"(block={self.block_size}, index_rate={use_index_rate})…",
+                        flush=True,
+                    )
                     model = load_rvc_v2(
                         path,
-                        index_path=index_path,
-                        device=device,
+                        index_path=use_index_path,
+                        device=torch_device,
                         download_hubert=True,
                         f0_up_key=f0_up_key,
-                        index_rate=index_rate,
+                        index_rate=use_index_rate,
                     )
                     in_dev, out_dev = auto_select_devices(input_device, output_device)
                     with self._lock:
@@ -294,6 +459,11 @@ class RealtimeSession:
                         self.output_device = out_dev
                         self.device = str(model.get("device"))
                     stream_sr = int(model["tgt_sr"])
+                    print(
+                        f"[session] Starting duplex in={in_dev} out={out_dev} "
+                        f"sr={stream_sr}",
+                        flush=True,
+                    )
                     run_stream(
                         model=model,
                         sample_rate=stream_sr,
@@ -303,26 +473,32 @@ class RealtimeSession:
                         stop_event=self._stop,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    self._error = str(exc)
-                    print(f"[session] {exc}", file=sys.stderr)
+                    with self._lock:
+                        self._error = str(exc)
+                    print(f"[session] {exc}", file=sys.stderr, flush=True)
                 finally:
                     with self._lock:
                         self.running = False
 
             self._thread = threading.Thread(target=worker, name="rvc-realtime", daemon=True)
             self._thread.start()
-            return self.status()
+        # Status AFTER releasing the lock (avoids deadlock with status()/worker).
+        return self.status()
 
-    def stop(self, timeout: float = 5.0) -> dict[str, Any]:
+    def stop(self, timeout: float = 30.0) -> dict[str, Any]:
         with self._lock:
             self._stop.set()
             thread = self._thread
         if thread is not None and thread.is_alive():
+            # One RVC block on CPU can take several seconds; wait longer than that.
             thread.join(timeout=timeout)
         with self._lock:
+            if thread is not None and thread.is_alive() and not self._error:
+                # Soft timeout: mark stopped for UI; daemon thread exits on process end
+                self._error = "stop timed out — stream may still be closing"
             self.running = False
             self._thread = None
-            return self.status()
+        return self.status()
 
 
 def dry_run(model_path: Path, *, download_hubert: bool = False) -> int:
@@ -414,11 +590,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--list-devices", action="store_true", help="Print audio devices and exit")
     p.add_argument(
         "--device",
-        default=None,
-        help="Torch device: cpu | mps | cuda (default: mps if available else cpu)",
+        default=DEFAULT_TORCH_DEVICE,
+        help="Torch device: cpu | mps | cuda (default: cpu for realtime stability)",
     )
     p.add_argument("--f0-up-key", type=int, default=0, help="Pitch shift in semitones")
-    p.add_argument("--index-rate", type=float, default=0.5, help="FAISS blend rate 0..1")
+    p.add_argument(
+        "--index-rate",
+        type=float,
+        default=DEFAULT_INDEX_RATE,
+        help="FAISS blend rate 0..1 (default 0 — IVF search can segfault on macOS)",
+    )
     p.add_argument(
         "--dry-run",
         action="store_true",
@@ -452,7 +633,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         model = load_rvc_v2(
             model_path,
-            index_path=args.index,
+            index_path=args.index if args.index_rate > 0 else None,
             device=args.device,
             download_hubert=True,
             f0_up_key=args.f0_up_key,

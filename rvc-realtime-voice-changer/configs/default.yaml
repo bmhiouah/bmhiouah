@@ -4,7 +4,7 @@ audio:
   # Stream defaults to the model sample rate (Frida = 40000). Override via --sr.
   sample_rate: 40000
   # Larger blocks → more stable RVC on CPU; smaller → lower latency / more underruns
-  block_size: 4096
+  block_size: 16384
   channels: 1
   # Leave null for auto: AirPods output when connected; built-in/default mic for input
   input_device: null
@@ -21,9 +21,10 @@ model:
   # Fallback: Female Pop Star — unzip models/FemalePopStar.zip -d models/_tmp/femalepopstar/
   #   path: models/_tmp/femalepopstar/model.pth
   #   index_path: models/_tmp/femalepopstar/model.index
-  # device: cpu | cuda | mps  (default: mps on Apple Silicon else cpu)
-  device: null
-  index_rate: 0.5
+  # device: cpu | cuda | mps  (realtime default: cpu — more stable than MPS in callback)
+  device: cpu
+  # 0 = skip FAISS (IVF search has segfaulted with faiss-cpu on macOS/numpy2)
+  index_rate: 0
   f0_up_key: 0
 
 runtime:

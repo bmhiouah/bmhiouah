@@ -432,15 +432,25 @@ class RVCModel:
             phone = self.hubert.final_proj(phone)
 
         if self.index is not None and self.big_npy is not None and self.index_rate != 0:
-            npy = phone[0].float().cpu().numpy()
-            score, ix = self.index.search(npy, k=8)
-            weight = np.square(1.0 / (score + 1e-8))
-            weight /= weight.sum(axis=1, keepdims=True)
-            npy = np.sum(self.big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
-            phone = (
-                torch.from_numpy(npy).unsqueeze(0).to(self.device) * self.index_rate
-                + (1.0 - self.index_rate) * phone
-            )
+            # faiss-cpu IVF search has segfaulted on some macOS/numpy stacks —
+            # keep index optional; callers can set index_rate=0 to skip entirely.
+            npy = np.ascontiguousarray(phone[0].float().detach().cpu().numpy(), dtype=np.float32)
+            try:
+                if hasattr(self.index, "nprobe"):
+                    self.index.nprobe = max(int(getattr(self.index, "nprobe", 1) or 1), 1)
+                score, ix = self.index.search(npy, k=8)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[index] search failed, disabling ({exc})", flush=True)
+                self.index = None
+                self.big_npy = None
+            else:
+                weight = np.square(1.0 / (score + 1e-8))
+                weight /= weight.sum(axis=1, keepdims=True)
+                npy = np.sum(self.big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
+                phone = (
+                    torch.from_numpy(npy).unsqueeze(0).to(self.device) * self.index_rate
+                    + (1.0 - self.index_rate) * phone
+                )
 
         # ~50 Hz → ~100 Hz content rate
         phone = F.interpolate(phone.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
