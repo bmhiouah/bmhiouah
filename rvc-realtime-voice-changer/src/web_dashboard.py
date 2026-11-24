@@ -707,7 +707,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     url = f"http://{host}:{port}/"
-    log(f"[dashboard] Serving {url} pid={os.getpid()} daemon={daemon}")
+    is_daemon_child = os.environ.get(_DAEMON_INNER_ENV) == "1"
+    log(
+        f"[dashboard] Serving {url} pid={os.getpid()} "
+        f"detached={is_daemon_child}"
+    )
     log("[dashboard] Press Ctrl+C to quit")
     try:
         server.serve_forever()
