@@ -14,12 +14,16 @@ Device policy:
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import os
 import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
+
+# Spawn isolates native audio/torch crashes from the HTTP server process.
+_MP = mp.get_context("spawn")
 
 import numpy as np
 
@@ -351,13 +355,68 @@ def run_stream(
         raise
 
 
+def _audio_worker_main(
+    model_path: str,
+    index_path: Optional[str],
+    input_device: Optional[int],
+    output_device: Optional[int],
+    block_size: int,
+    device: str,
+    f0_up_key: int,
+    index_rate: float,
+    stop_event: Any,
+) -> None:
+    """Child process entry: load RVC + run streams. Crashes here leave the dashboard alive."""
+    try:
+        path = Path(model_path)
+        if "frida" in path.name.lower():
+            ensure_frida_pth(path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Model not found: {path}")
+        print(
+            f"[session] Loading RVC on {device} (block={block_size}, index_rate={index_rate})…",
+            flush=True,
+        )
+        model = load_rvc_v2(
+            path,
+            index_path=index_path,
+            device=device,
+            download_hubert=True,
+            f0_up_key=f0_up_key,
+            index_rate=index_rate,
+        )
+        in_dev, out_dev = auto_select_devices(input_device, output_device)
+        stream_sr = int(model["tgt_sr"])
+        print(
+            f"[session] Starting duplex in={in_dev} out={out_dev} sr={stream_sr}",
+            flush=True,
+        )
+        run_stream(
+            model=model,
+            sample_rate=stream_sr,
+            block_size=block_size,
+            input_device=in_dev,
+            output_device=out_dev,
+            stop_event=stop_event,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[session] {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from exc
+
+
 class RealtimeSession:
-    """Start/stop wrapper around ``load_rvc_v2`` + ``run_stream`` for the web UI."""
+    """Start/stop wrapper for the web UI.
+
+    Audio runs in a **spawned child process** (not only a thread): a native
+    segfault in PortAudio/torch kills the child, while the HTTP dashboard stays up.
+    A small watcher thread joins the child and updates ``running`` / ``error``.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._thread: Optional[threading.Thread] = None
-        self._stop = threading.Event()
+        self._proc: Optional[mp.Process] = None
+        self._watcher: Optional[threading.Thread] = None
+        self._stop: Optional[Any] = None
         self._error: Optional[str] = None
         self.running = False
         self.model_path: Optional[str] = None
@@ -390,90 +449,80 @@ class RealtimeSession:
         f0_up_key: int = 0,
         index_rate: float = DEFAULT_INDEX_RATE,
     ) -> dict[str, Any]:
-        # IMPORTANT: never call status()/acquire this lock again while holding it —
-        # threading.Lock is not re-entrant and would deadlock Start + the worker
-        # before duplex ever opens (silent UI / hung /api/status).
+        # IMPORTANT: never call status() while holding this lock (non-reentrant).
         torch_device = device or DEFAULT_TORCH_DEVICE
-        # Skip FAISS by default — IVF search segfaults with current faiss-cpu/numpy.
         use_index_rate = float(index_rate)
-        use_index_path = index_path if use_index_rate > 0 else None
+        use_index_path = str(index_path) if index_path and use_index_rate > 0 else None
+        path = resolve_model_path(str(model_path))
+
         with self._lock:
             if self.running:
                 raise RuntimeError("Already speaking — stop first")
             self._error = None
-            self._stop.clear()
-            path = resolve_model_path(str(model_path))
             self.model_path = str(path)
             self.input_device = input_device
             self.output_device = output_device
             self.block_size = int(block_size)
             self.device = torch_device
             self.running = True
+            stop_event = _MP.Event()
+            self._stop = stop_event
+            proc = _MP.Process(
+                target=_audio_worker_main,
+                name="rvc-audio",
+                args=(
+                    str(path),
+                    use_index_path,
+                    input_device,
+                    output_device,
+                    int(block_size),
+                    torch_device,
+                    int(f0_up_key),
+                    use_index_rate,
+                    stop_event,
+                ),
+                daemon=True,
+            )
+            self._proc = proc
+            proc.start()
+            print(f"[session] audio worker pid={proc.pid}", flush=True)
 
-            def worker() -> None:
-                try:
-                    if "frida" in path.name.lower():
-                        ensure_frida_pth(path)
-                    if not path.is_file():
-                        raise FileNotFoundError(f"Model not found: {path}")
-                    print(
-                        f"[session] Loading RVC on {torch_device} "
-                        f"(block={self.block_size}, index_rate={use_index_rate})…",
-                        flush=True,
-                    )
-                    model = load_rvc_v2(
-                        path,
-                        index_path=use_index_path,
-                        device=torch_device,
-                        download_hubert=True,
-                        f0_up_key=f0_up_key,
-                        index_rate=use_index_rate,
-                    )
-                    in_dev, out_dev = auto_select_devices(input_device, output_device)
-                    with self._lock:
-                        self.input_device = in_dev
-                        self.output_device = out_dev
-                        self.device = str(model.get("device"))
-                    stream_sr = int(model["tgt_sr"])
-                    print(
-                        f"[session] Starting duplex in={in_dev} out={out_dev} "
-                        f"sr={stream_sr}",
-                        flush=True,
-                    )
-                    run_stream(
-                        model=model,
-                        sample_rate=stream_sr,
-                        block_size=self.block_size,
-                        input_device=in_dev,
-                        output_device=out_dev,
-                        stop_event=self._stop,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    with self._lock:
-                        self._error = str(exc)
-                    print(f"[session] {exc}", file=sys.stderr, flush=True)
-                finally:
-                    with self._lock:
-                        self.running = False
+            def watcher() -> None:
+                proc.join()
+                code = proc.exitcode
+                with self._lock:
+                    self.running = False
+                    self._proc = None
+                    # None/0 = clean; negative = killed by signal (e.g. segfault)
+                    if code not in (0, None) and not self._error:
+                        if code is not None and code < 0:
+                            self._error = f"audio worker crashed (signal {-code})"
+                        else:
+                            self._error = f"audio worker exited ({code})"
+                        print(f"[session] {self._error}", file=sys.stderr, flush=True)
 
-            self._thread = threading.Thread(target=worker, name="rvc-realtime", daemon=True)
-            self._thread.start()
-        # Status AFTER releasing the lock (avoids deadlock with status()/worker).
+            self._watcher = threading.Thread(target=watcher, name="rvc-watch", daemon=True)
+            self._watcher.start()
         return self.status()
 
     def stop(self, timeout: float = 30.0) -> dict[str, Any]:
         with self._lock:
-            self._stop.set()
-            thread = self._thread
-        if thread is not None and thread.is_alive():
-            # One RVC block on CPU can take several seconds; wait longer than that.
-            thread.join(timeout=timeout)
+            stop_event = self._stop
+            proc = self._proc
+            if stop_event is not None:
+                stop_event.set()
+        if proc is not None and proc.is_alive():
+            proc.join(timeout=timeout)
+            if proc.is_alive():
+                print("[session] stop timeout — terminating audio worker", flush=True)
+                proc.terminate()
+                proc.join(timeout=5.0)
         with self._lock:
-            if thread is not None and thread.is_alive() and not self._error:
-                # Soft timeout: mark stopped for UI; daemon thread exits on process end
+            if proc is not None and proc.is_alive() and not self._error:
                 self._error = "stop timed out — stream may still be closing"
             self.running = False
-            self._thread = None
+            self._proc = None
+            self._stop = None
         return self.status()
 
 
