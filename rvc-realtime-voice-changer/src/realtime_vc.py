@@ -14,13 +14,17 @@ Device policy:
 from __future__ import annotations
 
 import argparse
+import atexit
 import multiprocessing as mp
 import os
+import re
+import signal
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 # Spawn isolates native audio/torch crashes from the HTTP server process.
 _MP = mp.get_context("spawn")
@@ -31,6 +35,18 @@ try:
     import sounddevice as sd
 except (ImportError, OSError):  # pragma: no cover — missing package or PortAudio
     sd = None  # type: ignore[assignment]
+
+# Patterns matched by force-kill / --stop-all (orphan cleanup).
+_RVC_PGREP_PATTERNS = (
+    "src.web_dashboard",
+    "src.realtime_vc",
+    "web_dashboard",
+    "realtime_vc",
+)
+_RVC_PID_FILES = (
+    Path("/tmp/rvc-web-dashboard.pid"),
+    Path("/tmp/rvc-realtime-vc.pid"),
+)
 
 from .rvc_engine import (
     DEFAULT_FRIDA_INDEX,
@@ -291,6 +307,147 @@ def _pick_stream_sample_rate(
     return ordered[0] if ordered else 48000
 
 
+def abort_audio_streams() -> None:
+    """Abort PortAudio capture/playback immediately (unblocks stuck read/write)."""
+    if sd is None:
+        return
+    try:
+        sd.stop()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def force_kill_pid(pid: int, *, reason: str = "") -> bool:
+    """SIGKILL one PID. Returns True if a kill signal was sent."""
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return False
+    label = f" ({reason})" if reason else ""
+    print(f"[shutdown] SIGKILL pid={pid}{label}", flush=True)
+    try:
+        os.kill(pid, signal.SIGKILL)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError as exc:
+        print(f"[shutdown] cannot kill pid={pid}: {exc}", file=sys.stderr, flush=True)
+        return False
+
+
+def _pids_from_pidfiles() -> list[int]:
+    found: list[int] = []
+    for path in _RVC_PID_FILES:
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not text:
+            continue
+        try:
+            found.append(int(text.split()[0]))
+        except ValueError:
+            continue
+    return found
+
+
+def _pids_matching_rvc(*, exclude_pid: Optional[int] = None) -> list[tuple[int, str]]:
+    """Return (pid, cmdline) for live RVC-related processes."""
+    me = exclude_pid if exclude_pid is not None else os.getpid()
+    hits: dict[int, str] = {}
+    for pat in _RVC_PGREP_PATTERNS:
+        try:
+            out = subprocess.check_output(
+                ["pgrep", "-af", pat],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            continue
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Skip helpers that merely mention the path (git-lfs, editors, etc.)
+            if re.search(r"\bgit(-lfs)?\b|\brg\b|\bgrep\b|\bpgrep\b", line):
+                continue
+            if "kill_related_rvc" in line or "--stop-all" in line:
+                # Allow matching the target processes; skip only pure pgrep noise.
+                pass
+            parts = line.split(None, 1)
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            if pid == me:
+                continue
+            cmd = parts[1] if len(parts) > 1 else line
+            # Require a python / module footprint so we don't nuke unrelated names.
+            if not re.search(
+                r"(python|src\.web_dashboard|src\.realtime_vc|web_dashboard|realtime_vc)",
+                cmd,
+                re.I,
+            ):
+                continue
+            hits[pid] = cmd
+    for pid in _pids_from_pidfiles():
+        if pid == me or pid in hits:
+            continue
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            continue
+        hits[pid] = f"(from pidfile) pid={pid}"
+    return sorted(hits.items())
+
+
+def kill_related_rvc_processes(*, exclude_pid: Optional[int] = None) -> list[dict[str, Any]]:
+    """Force-kill every RVC dashboard/audio process. Returns kill records."""
+    abort_audio_streams()
+    records: list[dict[str, Any]] = []
+    for pid, cmd in _pids_matching_rvc(exclude_pid=exclude_pid):
+        sent = force_kill_pid(pid, reason=cmd[:120])
+        records.append({"pid": pid, "cmd": cmd, "killed": sent})
+    for path in _RVC_PID_FILES:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return records
+
+
+def install_shutdown_hooks(on_shutdown: Callable[[], None]) -> None:
+    """Run ``on_shutdown`` on SIGINT/SIGTERM/SIGHUP and at interpreter exit."""
+    done = {"n": 0}
+
+    def _run(_signum: Optional[int] = None, _frame: Any = None) -> None:
+        if done["n"]:
+            return
+        done["n"] = 1
+        if _signum is not None:
+            try:
+                name = signal.Signals(_signum).name
+            except (ValueError, AttributeError):
+                name = str(_signum)
+            print(f"[shutdown] signal {name} — stopping capture+playback", flush=True)
+        try:
+            on_shutdown()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[shutdown] hook error: {exc}", file=sys.stderr, flush=True)
+
+    atexit.register(_run)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _run)
+        except (ValueError, OSError):
+            # Signals unavailable in non-main threads / restricted hosts.
+            pass
+
+
 def run_stream(
     model: dict[str, Any],
     sample_rate: int,
@@ -360,59 +517,76 @@ def run_stream(
                 f"out={_device_name(output_device) if output_device is not None else 'default'}",
                 flush=True,
             )
-            while stop_event is None or not stop_event.is_set():
-                indata, overflowed = istream.read(block_size)
-                if overflowed:
-                    print(f"[audio] input overflow={overflowed}", file=sys.stderr, flush=True)
-                mono = np.asarray(indata[:, 0], dtype=np.float32)
-                rms_in = _rms(mono)
-                t0 = time.perf_counter()
-                try:
-                    if rms_in < silence_rms:
-                        # Near-silence: skip RVC (avoids hiss / hallucinated consonants).
-                        converted = np.zeros(block_size, dtype=np.float32)
+            try:
+                while stop_event is None or not stop_event.is_set():
+                    indata, overflowed = istream.read(block_size)
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    if overflowed:
+                        print(
+                            f"[audio] input overflow={overflowed}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    mono = np.asarray(indata[:, 0], dtype=np.float32)
+                    rms_in = _rms(mono)
+                    t0 = time.perf_counter()
+                    try:
+                        if rms_in < silence_rms:
+                            # Near-silence: skip RVC (avoids hiss / hallucinated consonants).
+                            converted = np.zeros(block_size, dtype=np.float32)
+                            prev_tail = None
+                        else:
+                            converted = infer_audio(mono, model, stream_sr)
+                            # Model may emit at tgt_sr (e.g. 40 kHz); resample to stream SR.
+                            if int(model_sr) != int(stream_sr):
+                                converted = _resample(converted, model_sr, stream_sr)
+                            if converted.shape[0] != block_size:
+                                converted = _match_length(converted, block_size)
+                            converted = _match_rms(converted, rms_in, gain=rms_gain)
+                            converted, prev_tail = _crossfade(
+                                prev_tail, converted, crossfade_n
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[infer] {exc}", file=sys.stderr, flush=True)
+                        converted = mono
                         prev_tail = None
-                    else:
-                        converted = infer_audio(mono, model, stream_sr)
-                        # Model may emit at tgt_sr (e.g. 40 kHz); resample to stream SR.
-                        if int(model_sr) != int(stream_sr):
-                            converted = _resample(converted, model_sr, stream_sr)
-                        if converted.shape[0] != block_size:
-                            converted = _match_length(converted, block_size)
-                        converted = _match_rms(converted, rms_in, gain=rms_gain)
-                        converted, prev_tail = _crossfade(prev_tail, converted, crossfade_n)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[infer] {exc}", file=sys.stderr, flush=True)
-                    converted = mono
-                    prev_tail = None
-                infer_ms = (time.perf_counter() - t0) * 1000.0
+                    infer_ms = (time.perf_counter() - t0) * 1000.0
 
-                outdata = np.zeros((block_size, out_ch), dtype=np.float32)
-                outdata[:, 0] = converted
-                if out_ch > 1:
-                    outdata[:, 1] = converted
-                under = ostream.write(outdata)
-                if under:
-                    print(f"[audio] output underflow={under}", file=sys.stderr, flush=True)
+                    outdata = np.zeros((block_size, out_ch), dtype=np.float32)
+                    outdata[:, 0] = converted
+                    if out_ch > 1:
+                        outdata[:, 1] = converted
+                    under = ostream.write(outdata)
+                    if under:
+                        print(
+                            f"[audio] output underflow={under}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
 
-                rms_out = _rms(converted)
-                stats["n"] += 1
-                stats["peak_in"] = max(stats["peak_in"], rms_in)
-                stats["peak_out"] = max(stats["peak_out"], rms_out)
-                n = stats["n"]
-                if n <= 8 or n % 20 == 0:
-                    print(
-                        f"[audio] block={n} rms_in={rms_in:.5f} rms_out={rms_out:.5f} "
-                        f"peak_in={stats['peak_in']:.5f} peak_out={stats['peak_out']:.5f} "
-                        f"infer_ms={infer_ms:.0f}",
-                        flush=True,
-                    )
+                    rms_out = _rms(converted)
+                    stats["n"] += 1
+                    stats["peak_in"] = max(stats["peak_in"], rms_in)
+                    stats["peak_out"] = max(stats["peak_out"], rms_out)
+                    n = stats["n"]
+                    if n <= 8 or n % 20 == 0:
+                        print(
+                            f"[audio] block={n} rms_in={rms_in:.5f} rms_out={rms_out:.5f} "
+                            f"peak_in={stats['peak_in']:.5f} peak_out={stats['peak_out']:.5f} "
+                            f"infer_ms={infer_ms:.0f}",
+                            flush=True,
+                        )
+            finally:
+                # Ensure PortAudio drops the devices even if the loop breaks mid-block.
+                abort_audio_streams()
             print(
                 f"[audio] duplex CLOSED after {stats['n']} blocks "
                 f"peak_in={stats['peak_in']:.5f} peak_out={stats['peak_out']:.5f}",
                 flush=True,
             )
     except Exception as exc:  # noqa: BLE001
+        abort_audio_streams()
         print(f"[audio] Stream open/run failed: {exc}", file=sys.stderr, flush=True)
         raise
 
@@ -599,21 +773,37 @@ class RealtimeSession:
             self._watcher.start()
         return self.status()
 
-    def stop(self, timeout: float = 30.0) -> dict[str, Any]:
+    def stop(self, timeout: float = 2.0) -> dict[str, Any]:
+        """Stop capture+playback. Escalates stop_event → SIGTERM → SIGKILL."""
         with self._lock:
             stop_event = self._stop
             proc = self._proc
             if stop_event is not None:
                 stop_event.set()
+        # Unblock PortAudio in this process too (parent may hold no streams,
+        # but abort is cheap and helps if a thread still has one open).
+        abort_audio_streams()
         if proc is not None and proc.is_alive():
             proc.join(timeout=timeout)
             if proc.is_alive():
-                print("[session] stop timeout — terminating audio worker", flush=True)
-                proc.terminate()
-                proc.join(timeout=5.0)
+                print("[session] stop timeout — SIGTERM audio worker", flush=True)
+                try:
+                    proc.terminate()
+                except Exception:  # noqa: BLE001
+                    pass
+                proc.join(timeout=1.0)
+            if proc.is_alive():
+                print("[session] escalate — SIGKILL audio worker", flush=True)
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+                if proc.pid:
+                    force_kill_pid(proc.pid, reason="rvc-audio worker")
+                proc.join(timeout=1.0)
         with self._lock:
             if proc is not None and proc.is_alive() and not self._error:
-                self._error = "stop timed out — stream may still be closing"
+                self._error = "stop timed out — forced kill attempted"
             self.running = False
             self._proc = None
             self._stop = None
@@ -746,11 +936,27 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Download lj1995 hubert_base.pt and convert if missing",
     )
+    p.add_argument(
+        "--stop-all",
+        action="store_true",
+        help="Force-kill all RVC dashboard/audio processes (SIGKILL) and exit",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
+    if args.stop_all:
+        records = kill_related_rvc_processes()
+        if not records:
+            print("[shutdown] no RVC processes found", flush=True)
+        else:
+            for rec in records:
+                print(
+                    f"[shutdown] pid={rec['pid']} killed={rec['killed']} cmd={rec['cmd'][:160]}",
+                    flush=True,
+                )
+        return 0
     if args.list_devices:
         list_devices()
         return 0
@@ -786,6 +992,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     in_dev, out_dev = auto_select_devices(args.input_device, args.output_device)
     stream_sr = args.sr or int(model["tgt_sr"])
 
+    stop_event = threading.Event()
+    pid_path = Path("/tmp/rvc-realtime-vc.pid")
+    try:
+        pid_path.write_text(str(os.getpid()) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+    def _cli_shutdown() -> None:
+        stop_event.set()
+        abort_audio_streams()
+        try:
+            pid_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    install_shutdown_hooks(_cli_shutdown)
+
     try:
         run_stream(
             model=model,
@@ -793,9 +1016,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             block_size=args.block_size,
             input_device=in_dev,
             output_device=out_dev,
+            stop_event=stop_event,
         )
     except KeyboardInterrupt:
-        print("\n[audio] stopped")
+        print("\n[audio] stopped", flush=True)
     except Exception as exc:  # noqa: BLE001
         # Headless / no PortAudio devices
         print(f"[audio] Stream failed: {exc}", file=sys.stderr)
@@ -805,6 +1029,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             file=sys.stderr,
         )
         return 1
+    finally:
+        _cli_shutdown()
     return 0
 
 

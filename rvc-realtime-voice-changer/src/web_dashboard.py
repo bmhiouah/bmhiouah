@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import sys
 import threading
 import traceback
@@ -28,9 +27,6 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-# Set by the --daemon re-exec child so we don't spawn forever.
-_DAEMON_INNER_ENV = "RVC_DASHBOARD_DAEMON_INNER"
-
 from .realtime_vc import (
     DEFAULT_BLOCK,
     DEFAULT_F0_UP_KEY,
@@ -38,7 +34,10 @@ from .realtime_vc import (
     DEFAULT_RMS_GAIN,
     ROOT,
     RealtimeSession,
+    abort_audio_streams,
     auto_select_devices,
+    install_shutdown_hooks,
+    kill_related_rvc_processes,
 )
 from .rvc_engine import DEFAULT_FRIDA_PTH, ensure_frida_pth
 
@@ -730,41 +729,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._json(404, {"error": "Not found"})
 
 
-def _spawn_daemon(argv: list[str], pid_path: Path, log_path: Path) -> int:
-    """Re-exec in a new session so the server survives the launching shell.
-
-    Prefer subprocess+start_new_session over fork(): PortAudio/torch may already
-    have threads after import, and fork-after-threads is unsafe on macOS.
-    """
-    child_argv = [sys.executable, "-u", "-m", "src.web_dashboard", *argv]
-    # Strip --daemon so the child runs the server; keep other flags.
-    child_argv = [a for a in child_argv if a != "--daemon"]
-    env = os.environ.copy()
-    env[_DAEMON_INNER_ENV] = "1"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_f = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 — kept for daemon lifetime
-    proc = subprocess.Popen(
-        child_argv,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=log_f,
-        stderr=log_f,
-        start_new_session=True,
-        cwd=str(ROOT),
-    )
-    pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text(str(proc.pid) + "\n", encoding="utf-8")
-    print(f"[dashboard] daemon started pid={proc.pid} log={log_path}", flush=True)
-    return 0
-
-
 def main(argv: Optional[list[str]] = None) -> int:
     args = argv if argv is not None else sys.argv[1:]
     host = HOST
     port = PORT
-    daemon = False
     pid_path = Path("/tmp/rvc-web-dashboard.pid")
-    log_path = Path("/tmp/rvc-web-dashboard.log")
+    stop_all = False
     i = 0
     while i < len(args):
         if args[i] == "--host" and i + 1 < len(args):
@@ -774,20 +744,38 @@ def main(argv: Optional[list[str]] = None) -> int:
             port = int(args[i + 1])
             i += 2
         elif args[i] == "--daemon":
-            daemon = True
+            # Kept as a no-op for old scripts. Orphan detach was removed: exit must
+            # always stop capture+playback (no surviving session after close).
+            log(
+                "[dashboard] --daemon ignored: orphan detach disabled "
+                "(use foreground; --stop-all to force-kill leftovers)"
+            )
+            i += 1
+        elif args[i] == "--stop-all":
+            stop_all = True
             i += 1
         elif args[i] == "--pid-file" and i + 1 < len(args):
             pid_path = Path(args[i + 1])
             i += 2
         elif args[i] == "--log-file" and i + 1 < len(args):
-            log_path = Path(args[i + 1])
+            # Accepted for backwards compat; logging stays on stdout/stderr.
             i += 2
         else:
             print(f"Unknown arg: {args[i]}", file=sys.stderr)
             return 2
 
-    if daemon and os.environ.get(_DAEMON_INNER_ENV) != "1":
-        return _spawn_daemon(args, pid_path, log_path)
+    if stop_all:
+        records = kill_related_rvc_processes()
+        if not records:
+            print("[shutdown] no RVC processes found", flush=True)
+        else:
+            for rec in records:
+                print(
+                    f"[shutdown] pid={rec['pid']} killed={rec['killed']} "
+                    f"cmd={rec['cmd'][:160]}",
+                    flush=True,
+                )
+        return 0
 
     # Warm device defaults into the log (no audio stream yet)
     log("[dashboard] Idle — waiting for Start in the browser")
@@ -808,19 +796,50 @@ def main(argv: Optional[list[str]] = None) -> int:
     log(f"[dashboard] {n} voice(s) discovered under models/")
 
     server = ThreadingHTTPServer((host, port), DashboardHandler)
+    # Allow fast rebinds after crash / force-kill.
+    server.allow_reuse_address = True
     url = f"http://{host}:{port}/"
-    is_daemon_child = os.environ.get(_DAEMON_INNER_ENV) == "1"
-    log(
-        f"[dashboard] Serving {url} pid={os.getpid()} "
-        f"detached={is_daemon_child}"
-    )
-    log("[dashboard] Press Ctrl+C to quit")
+    log(f"[dashboard] Serving {url} pid={os.getpid()} detached=false")
+    log("[dashboard] Press Ctrl+C to quit (always stops capture+playback)")
+
+    shutting_down = {"done": False}
+
+    def _shutdown() -> None:
+        if shutting_down["done"]:
+            return
+        shutting_down["done"] = True
+        log("[dashboard] shutting down — stopping capture+playback")
+        try:
+            _session.stop(timeout=1.5)
+        except Exception as exc:  # noqa: BLE001
+            log(f"[dashboard] session stop error: {exc}")
+        abort_audio_streams()
+        try:
+            server.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            server.server_close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            pid_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    install_shutdown_hooks(_shutdown)
+    try:
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(str(os.getpid()) + "\n", encoding="utf-8")
+    except OSError as exc:
+        log(f"[dashboard] could not write pid file {pid_path}: {exc}")
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        log("\n[dashboard] shutting down")
-        _session.stop(timeout=2.0)
-        server.shutdown()
+        pass
+    finally:
+        _shutdown()
     return 0
 
 

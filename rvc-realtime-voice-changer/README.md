@@ -64,10 +64,14 @@ python -m src.realtime_vc --dry-run --download-hubert
 
 ```bash
 source .venv/bin/activate
-python -m src.web_dashboard --daemon # survives shell exit; PID /tmp/rvc-web-dashboard.pid
-# or foreground:
-python -m src.web_dashboard          # http://127.0.0.1:8765/
+python -m src.web_dashboard          # http://127.0.0.1:8765/  (foreground; PID /tmp/rvc-web-dashboard.pid)
+# Force-kill leftovers (dashboard + audio children) if anything survived a crash:
+python -m src.web_dashboard --stop-all
+# same helper on the CLI entry:
+python -m src.realtime_vc --stop-all
 ```
+
+Exit (Ctrl+C / SIGTERM / SIGHUP / process exit) always stops capture+playback: signal + atexit hooks, `sd.stop()`, and audio-worker escalate to SIGKILL. `--daemon` is ignored (no orphan detach).
 
 - **Voice** dropdown lists every `models/*.zip` plus extracted `.pth` under `models/_tmp/` (unavailable LFS placeholders are disabled)
 - Choose input (default: MacBook / built-in mic) and output (default: EarPods / AirPods)
